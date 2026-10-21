@@ -242,6 +242,42 @@ def test_reactive_loads(tmp_path):
     assert np.all(np.abs(s) < 1.005)                                  # passive
 
 
+@pytest.mark.parametrize('el', [dict(L=10e-9), dict(R=0.0, L=5e-9, C=2e-12, LEtype=1)])
+def test_end_criterion_counts_the_lumped_energy(el):
+    """The energy the end criterion watches includes the lumped branches' (L I^2 / 2, q^2 / 2C): in a lossless PEC
+    box with the plates charged and an L or series LC across them, the field's own energy swings by half as it
+    moves into the branch and back, the total is steady, and steadiest with the branch's energy as it is (not
+    scaled): the L and C are the element's. A lumped LC filter had ended its run early on the field alone."""
+    from gfdtd.engine import make_backend
+    F = openEMS(NrTS=100, EndCriteria=1e-5)
+    F.SetGaussExcite(1e9, 1e9)
+    F.SetBoundaryCond(['PEC'] * 6)
+    csx = ContinuousStructure()
+    F.SetCSX(csx)
+    g = csx.GetGrid()
+    g.SetDeltaUnit(1e-3)
+    g.SetLines('x', np.arange(-3, 3.01, 0.5))
+    g.SetLines('y', np.arange(-3, 3.01, 0.5))
+    g.SetLines('z', np.arange(0, 3.01, 0.5))
+    m = csx.AddMetal('plate')
+    m.AddBox([-1, -1, 1], [1, 1, 1], priority=10)
+    m.AddBox([-1, -1, 2], [1, 1, 2], priority=10)
+    csx.AddLumpedElement('load', ny='z', caps=True, **el).AddBox([1, 0, 1], [1, 0, 2], priority=12)
+    be = make_backend(build(csx, F.settings(), log=lambda *a: None), 'core' if core_info()[0] else 'numpy')
+    be.V[2, 4:9, 4:9, 2:4] = 1.0                                      # Ez between the plates
+    total, lumped = [], []
+    for s in range(4000):
+        be.step(None)
+        if s % 10 == 0:
+            total.append(be.energy())
+            lumped.append(be.lumped_energy())
+    total, lumped = np.array(total[5:]), np.array(lumped[5:])
+    field = total - lumped
+    flat = lambda k: (field + k * lumped).min() / (field + k * lumped).max()
+    assert field.min() / field.max() < 0.6 and lumped.max() > 0.3 * total.max()
+    assert flat(1) > 0.8 and flat(1) > flat(0.75) and flat(1) > flat(1.25)
+
+
 def test_debye_material_xml_both_ways(tmp_path):
     csx = ContinuousStructure()
     m = csx.AddDebyeMaterial('sub', order=2, epsilon=3.0, kappa=1e-3)

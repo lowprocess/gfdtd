@@ -1,6 +1,6 @@
 """
 The time loop: H and E updates on a backend, the extensions (PML slabs, Mur boundaries, Debye poles, soft E
-excitations, lumped branches), probes, field dumps, the energy end criterion, and openEMS's outputs: its status
+excitations, lumped branches), probes, field dumps, the energy end criterion (the field's and the lumped branches'), and openEMS's outputs: its status
 lines on stdout, its probe files (port_ut_1 ...) and its dump files in the run folder.
 
     Engine(op, backend='auto').run(path, nr_ts, end_crit)
@@ -126,6 +126,7 @@ class NumpyBackend:
             self.pl_idx, self.pl_k = xp.asarray(idx), xp.asarray(op.dt / np.array(L), dt)
             self.pl_vi = vi_at(idx)
             self.pl_I = xp.zeros(len(idx), dt)
+            self.pl_L = xp.asarray(np.array(L, float))
         if op.series:
             idx, R, L, Cs = zip(*op.series)
             idx = np.array(idx, np.int64)
@@ -139,6 +140,7 @@ class NumpyBackend:
                                                                             Cinv / den))
             self.se_I = xp.zeros(len(idx), dt)
             self.se_q = xp.zeros(len(idx), dt)
+            self.se_L, self.se_Cinv = xp.asarray(L), xp.asarray(Cinv)
             self.dtf = dt(op.dt)
         vt = [p for p in op.probes if p['field'] == 'V']
         it = [p for p in op.probes if p['field'] == 'I']
@@ -303,7 +305,18 @@ class NumpyBackend:
         with np.errstate(divide='ignore', invalid='ignore'):
             e = np.where(self.vi > 0, self.V * self.V / self.vi, 0).sum(dtype=np.float64)
             e += np.where(self.iv > 0, self.I * self.I / self.iv, 0).sum(dtype=np.float64)
-        return float(e) * self.op.dt / 2
+        return float(e) * self.op.dt / 2 + self.lumped_energy()
+
+    def lumped_energy(self):
+        """The energy in the lumped branches (J): L I^2 / 2 in the inductors, q^2 / 2C in the series capacitors.
+        Not in the field: a lumped LC filter rings in its branches, and the end criterion must see it."""
+        e = 0.0
+        if self.op.par_L:
+            e += float((self.pl_L * self.pl_I.astype(np.float64) ** 2).sum())
+        if self.op.series:
+            I, q = self.se_I.astype(np.float64), self.se_q.astype(np.float64)
+            e += float((self.se_L * I ** 2 + self.se_Cinv * q ** 2).sum())
+        return e / 2
 
     def fetch(self, n):
         return np.array(self.buf[:n], float)
@@ -376,7 +389,7 @@ class CoreBackend(_Compressed, NumpyBackend):
 
     def energy(self):
         return self.core.energy(self.V, self.I, self.code, self.ts, self.G, *self.idims, self.ke, self.kh) * \
-            self.op.dt / 2
+            self.op.dt / 2 + self.lumped_energy()
 
 
 class CupyBackend(_Compressed, NumpyBackend):
@@ -589,7 +602,7 @@ class CupyBackend(_Compressed, NumpyBackend):
         g = (min((self.n + self.BLOCK - 1) // self.BLOCK, 4096),)
         self.k['energy'](g, (self.BLOCK,), (self.V, self.I, self.code, self.ts, self.G, *self.dims, self.ke, self.kh,
                                             self.e_out))
-        return float(self.e_out[0]) * self.op.dt / 2
+        return float(self.e_out[0]) * self.op.dt / 2 + self.lumped_energy()
 
     def fetch(self, n):
         return self.cp.asnumpy(self.buf[:n]).astype(float)
