@@ -302,20 +302,25 @@ class NumpyBackend:
                 np.add.at(row, pid, w * F.reshape(-1)[idx])
 
     def energy(self):
+        """The energy (J) the end criterion watches: the field's and the lumped branches' (one host sync)."""
+        return float(self.field_energy() + self.lumped_energy())
+
+    def field_energy(self):
         with np.errstate(divide='ignore', invalid='ignore'):
             e = np.where(self.vi > 0, self.V * self.V / self.vi, 0).sum(dtype=np.float64)
             e += np.where(self.iv > 0, self.I * self.I / self.iv, 0).sum(dtype=np.float64)
-        return float(e) * self.op.dt / 2 + self.lumped_energy()
+        return e * self.op.dt / 2
 
     def lumped_energy(self):
-        """The energy in the lumped branches (J): L I^2 / 2 in the inductors, q^2 / 2C in the series capacitors.
-        Not in the field: a lumped LC filter rings in its branches, and the end criterion must see it."""
+        """The energy in the lumped branches (J, a scalar on the backend's device): L I^2 / 2 in the inductors,
+        q^2 / 2C in the series capacitors. Not in the field: a lumped LC filter rings in its branches."""
         e = 0.0
         if self.op.par_L:
-            e += float((self.pl_L * self.pl_I.astype(np.float64) ** 2).sum())
+            i = self.pl_I.astype(np.float64)
+            e = e + self.pl_L @ (i * i)
         if self.op.series:
-            I, q = self.se_I.astype(np.float64), self.se_q.astype(np.float64)
-            e += float((self.se_L * I ** 2 + self.se_Cinv * q ** 2).sum())
+            i, q = self.se_I.astype(np.float64), self.se_q.astype(np.float64)
+            e = e + self.se_L @ (i * i) + self.se_Cinv @ (q * q)
         return e / 2
 
     def fetch(self, n):
@@ -387,9 +392,9 @@ class CoreBackend(_Compressed, NumpyBackend):
         if self.op.mur is not None:
             self.core.mur_post(self.V, self.m0, self.m1, self.mk, self.o0, self.o1)
 
-    def energy(self):
+    def field_energy(self):
         return self.core.energy(self.V, self.I, self.code, self.ts, self.G, *self.idims, self.ke, self.kh) * \
-            self.op.dt / 2 + self.lumped_energy()
+            self.op.dt / 2
 
 
 class CupyBackend(_Compressed, NumpyBackend):
@@ -597,12 +602,12 @@ class CupyBackend(_Compressed, NumpyBackend):
                 idx, w, pid = t
                 self._launch('probe', len(idx), F, idx, w, pid, row, np.int64(len(idx)))
 
-    def energy(self):
+    def field_energy(self):
         self.e_out.fill(0)
         g = (min((self.n + self.BLOCK - 1) // self.BLOCK, 4096),)
         self.k['energy'](g, (self.BLOCK,), (self.V, self.I, self.code, self.ts, self.G, *self.dims, self.ke, self.kh,
                                             self.e_out))
-        return float(self.e_out[0]) * self.op.dt / 2 + self.lumped_energy()
+        return self.e_out[0] * (self.op.dt / 2)
 
     def fetch(self, n):
         return self.cp.asnumpy(self.buf[:n]).astype(float)
@@ -642,8 +647,8 @@ class Engine:
         return out
 
     def run(self, path, nr_ts, end_crit, verbose=1, out=print):
-        """Run up to nr_ts timesteps in folder `path` (probe files written there), ending when the field energy
-        falls below end_crit times its peak after the excitation. Returns dict(steps, seconds, reason, db)."""
+        """Run up to nr_ts timesteps in folder `path` (probe files written there), ending when the energy (the
+        field's and the lumped branches', backend.energy) falls below end_crit times its peak after the excitation. Returns dict(steps, seconds, reason, db)."""
         op, be = self.op, self.be
         dt, sig, sub = op.dt, op.signal, op.sub
         os.makedirs(path, exist_ok=True)
