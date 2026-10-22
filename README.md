@@ -78,9 +78,11 @@ file that both `gfdtd` and `openEMS` can run.
 | Materials | isotropic epsilon and conductivity (kappa), averaged over the four cells around each edge |
 | Dispersion | Debye materials (`DebyeMaterial`, any number of poles): `--diel wideband` |
 | Metal | `Metal` and `ConductingSheet`, both as PEC: no conductor loss (`--sigma` is ignored) |
-| Primitives | Box, Polygon, LinPoly, Cylinder |
+| Primitives | Box, Polygon, LinPoly, Cylinder, CylindricalShell, Curve (a wire along the mesh edges nearest to it, as openEMS's) |
 | Lumped elements | R, L, C: parallel, or series RLC (`LEtype=1`), with metal caps |
-| Ports | lumped ports; soft E-field excitations; voltage and current probes |
+| Ports | all of openEMS's Python ports: lumped, curve, microstrip (MSL), stripline, CPW, coaxial, rectangular and circular waveguide, any waveguide mode by functions or mode file ([Ports](#ports)) |
+| Excitations | soft and hard, E and H field (types 0-3), weighted by functions of x, y, z, rho, a, r, t or a mode file, delayed |
+| Probes | voltage, current, voltage and current mode matching (types 10, 11) |
 | Excitation | Gaussian pulse (openEMS's) |
 | Boundaries | PEC, PMC, first-order Mur, PML_n (convolutional PML over the n outermost cells, PEC behind it) |
 | Field dumps | `DumpBox` E, H, J (rot H), Jc (kappa E); time domain (.vtr) and frequency domain (HDF5); at the cell centres (dump mode 2) or the nodes (modes 0, 1); one file per box |
@@ -88,8 +90,47 @@ file that both `gfdtd` and `openEMS` can run.
 | End | the energy in the field and in the lumped parts (`EndCriteria`), timestep limit, `ABORT` |
 
 Not yet: conductor loss (`--sigma`: conducting sheets run as PEC), Lorentz materials, phased drives in antenna
-mode (`--drive`: the first port alone), time-domain NF2FF, `--converge`, waveguide and MSL ports, and
-cylindrical grids. A file that holds these is still read: what gfdtd doesn't model is listed as a note.
+mode (`--drive`: the first port alone), time-domain NF2FF, `--converge`, the mode-purity column of
+mode-matching probes, field probes (types 2, 3), and cylindrical grids. A file that holds these is still read:
+what gfdtd doesn't model is listed as a note.
+
+<a id="ports"></a>
+## Ports
+
+`gfdtd.ports` has openEMS's Python port classes, made as openEMS makes them (the same metal, probes and
+excitations, the same post-processing), and `openEMS` has their `Add...Port` methods:
+
+```python
+port = FDTD.AddMSLPort(1, metal, start, stop, 'x', 'z', excite=-1, FeedShift=10, MeasPlaneShift=30)
+port = FDTD.AddStripLinePort(1, metal, start, stop, 'x', 'z', height, excite=1)
+port = FDTD.AddCPWPort(1, metal, start, stop, 'x', 'y', gap, excite=1)
+port = FDTD.AddCoaxialPort(1, pec, fill, start, stop, 'z', r_i, r_o, r_os, excite=1)
+port = FDTD.AddRectWaveGuidePort(0, start, stop, 'z', a, b, 'TE10', excite=1)
+port = FDTD.AddCircWaveGuidePort(0, start, stop, 'z', radius, 'TE11', excite=1)
+port = FDTD.AddWaveGuidePort(0, start, stop, 'z', E_func, H_func, kc, excite=1)   # or E_file / H_file
+port = FDTD.AddCurvePort(1, 50, start, stop, excite=1)
+```
+
+The transmission-line ports take the line's impedance and propagation constant from three voltage and two current
+probes along it; the waveguide ports match the field on the port plane to the mode (mode-matching probes, at the
+nodes for E and the cells for H, normalised as openEMS's) and take the impedance from the mode's cutoff. Small
+models on both engines (largest |S| difference over the band; the same model built through either API):
+
+| Port | Model | ΔS11 | ΔS21 |
+|---|---|---|---|
+| rectangular waveguide, TE10 | WR-90 with a dielectric block, 8-12 GHz | 0.007 | 0.003 |
+| coaxial | PTFE line with an air section, 1-9 GHz | 0.007 | 0.018 |
+| stripline | a wide section, 1-9 GHz | 0.006 | 0.003 |
+| microstrip | an open stub, 1-9 GHz | 0.029 | 0.021 |
+| curve | a microstrip line between two curve ports | 0.008 | 0.010 |
+| CPW (lumped ports across one gap) | no ground plane, 6 mm of air past the ends | 0.004 | 0.004 |
+
+With the strips running into the Mur walls instead (the board's ends at the boundary), the two engines part by
+up to 0.1 in S11 on the open CPW: they treat metal at an absorbing wall differently. kicad2ems keeps air
+between the board and the boundary, so it doesn't meet this.
+
+Before these ports, a current probe whose normal was y ran its loop the wrong way round (the current came out
+negated, |S11| near 95 for a lumped port along y); x and z were right, which is why no example showed it.
 
 ## How it works
 
@@ -245,7 +286,8 @@ Tried and left out:
 ```
 gfdtd/
   csx.py        CSXCAD's structure: grid, properties, primitives; its XML both ways
-  fdtd.py       openEMS's interface: settings, LumpedPort, Run, the XML; the command line
+  fdtd.py       openEMS's interface: settings, LumpedPort, the Add...Port methods, Run, the XML; the command line
+  ports.py      openEMS's other ports: MSL, stripline, CPW, coaxial, waveguides, curve
   operator.py   the model on the grid: coefficients, lumped elements, excitations, boundaries, probes
   engine.py     the time loop, the numpy, core and CuPy backends, status lines and probe files
   dumps.py      the field dumps: cell-centre and node values, .vtr frames, running DFT, HDF5
@@ -255,5 +297,7 @@ gfdtd/
 kicad2ems/solvers/gfdtd.py   the solver plugin (openEMS's plugin, run on gfdtd)
 tests/test_gfdtd.py          compatibility, operator, physics on small models, the far field, GPU and core
                              against numpy
+tests/test_gfdtd_ports.py    the ports, weighted / hard / H / delayed excitations, mode matching, shells,
+                             curves, current-probe snapping
 tools/bench_gfdtd.py         the engine's per-operation timings by backend and model size
 ```

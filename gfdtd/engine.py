@@ -116,6 +116,8 @@ class NumpyBackend:
         xp, op, dt = self.xp, self.op, self.dt
         vi_at = lambda flat: xp.asarray(np.asarray(op.vi.reshape(-1)[flat], dt))
         self.exc_idx, self.exc_amp = xp.asarray(op.exc[0]), xp.asarray(op.exc[1], dt)
+        self.more = [dict(g, idx=xp.asarray(g['idx']), amp=xp.asarray(g['amp'], dt))
+                     for g in getattr(op, 'exc_more', [])]
         if op.mur is not None:
             self.m0, self.m1, self.mk = xp.asarray(op.mur[0]), xp.asarray(op.mur[1]), xp.asarray(op.mur[2], dt)
             self.o0 = xp.zeros(len(op.mur[0]), dt)
@@ -174,18 +176,43 @@ class NumpyBackend:
             self.db_i = xp.zeros(len(idx), dt)
 
     # ---- the updates ---------------------------------------------------------------------------------------
-    def step(self, sig=None):
-        """One timestep: H, its PML, E (with the Debye poles), its PML, the excitation (sig: the signal's value,
-        None past its end), the lumped branches and Mur."""
+    def step(self, sig=None, n=None):
+        """One timestep: H, its PML, the H excitations, E (with the Debye poles), its PML, the excitation (sig: the
+        signal's value, None past its end) and the delayed ones (n: the step), the lumped branches and Mur."""
         self.update_H()
         self.pml_h()
+        if self.more and n is not None:
+            self.excite_more('I', n)
         self.mur_pre()
         self.update_E()
         self.pml_e()
         if sig is not None:
             self.excite(sig)
+        if self.more and n is not None:
+            self.excite_more('V', n)
         self.lumped()
         self.mur_post()
+
+    def excite_more(self, field, n):
+        """The excitation groups on field 'V' or 'I' at step n: each its delay late, on the H signal (half a step
+        later) for 'I'; a hard group sets its edges, a soft one adds to them."""
+        sig = self.op.signal_h if field == 'I' else self.op.signal
+        F = self.I if field == 'I' else self.V
+        for g in self.more:
+            if g['field'] != field:
+                continue
+            k = n - g['delay']
+            val = float(sig[k]) if 0 <= k < len(sig) else 0.0
+            if g['hard']:
+                self.assign(F, g['idx'], g['amp'], val)
+            elif val:
+                self.add(F, g['idx'], g['amp'], val)
+
+    def add(self, F, idx, amp, val):
+        np.add.at(F.reshape(-1), idx, amp * self.dt(val))
+
+    def assign(self, F, idx, amp, val):
+        F.reshape(-1)[idx] = amp * self.dt(val)
 
     def update_H(self):
         (Vx, Vy, Vz), (Ix, Iy, Iz), (ax, ay, az) = self.V, self.I, self.iv
@@ -494,11 +521,12 @@ class CupyBackend(_Compressed, NumpyBackend):
                 best[mode] = min(best.get(mode, dt / n), dt / n)
         return min(best, key=best.get)
 
-    def step(self, sig=None):
+    def step(self, sig=None, n=None):
         """One timestep in three launches: H with its PML and the Mur copies, E with the Debye poles and its PML,
-        then the excitation, lumped branches and Mur update together (or separately: see _fused)."""
+        then the excitation, lumped branches and Mur update together (or separately: see _fused). The H excitations
+        and the delayed ones (n: the step) run between them."""
         if self.mode == 'separate':
-            return NumpyBackend.step(self, sig)
+            return NumpyBackend.step(self, sig, n)
         g = lambda m: (min((m + self.BLOCK - 1) // self.BLOCK, 65535 * 8),)
         split = self.mode == 'split'
         ns = np.int32(0) if split else self.ns
@@ -509,6 +537,8 @@ class CupyBackend(_Compressed, NumpyBackend):
                                                                   o0, o1, np.int64(self.n_mu)))
         if split:
             self._pml_k('H')
+        if self.more and n is not None:
+            self.excite_more('I', n)
         psi, b, c, desc = self.hE
         self.k['step_e'](self.grid, (self.BLOCK,), (self.V, self.I, self.code, self.tvv, self.ts, self.tpole, self.tkb,
                                                     self.tka, self.th, np.int32(self.P), self.slot, self.pol, self.G,
@@ -516,6 +546,8 @@ class CupyBackend(_Compressed, NumpyBackend):
                                                     self.boxE))
         if split:
             self._pml_k('E')
+        if self.more and n is not None:
+            self.excite_more('V', n)
         n_ex = self.n_ex if sig is not None else 0
         m = n_ex + self.n_pl + self.n_se + self.n_mu
         if m:
@@ -584,6 +616,12 @@ class CupyBackend(_Compressed, NumpyBackend):
     def excite(self, s):
         self._launch('excite', len(self.exc_idx), self.V, self.exc_idx, self.exc_amp, np.float32(s),
                      np.int64(len(self.exc_idx)))
+
+    def add(self, F, idx, amp, val):
+        self._launch('excite', len(idx), F, idx, amp, np.float32(val), np.int64(len(idx)))
+
+    def assign(self, F, idx, amp, val):
+        self._launch('assign', len(idx), F, idx, amp, np.float32(val), np.int64(len(idx)))
 
     def lumped(self):
         if self.op.par_L:
@@ -682,7 +720,7 @@ class Engine:
         try:
             while s < nr_ts:
                 s += 1
-                be.step(sig[s] if s < nexc else None)
+                be.step(sig[s] if s < nexc else None, s)
                 if s % sub == 0:
                     be.probe(len(pending))
                     pending.append(s)
@@ -704,7 +742,7 @@ class Engine:
                     if not np.isfinite(e):
                         reason = 'unstable'
                         break
-                    if s > nexc and emax > 0 and e < end_crit * emax:
+                    if s > nexc + getattr(op, 'delay_max', 0) and emax > 0 and e < end_crit * emax:
                         reason = 'end'
                         break
                     if os.path.exists(abort):

@@ -124,11 +124,14 @@ def inside(q, pts, grid, flat_snap=True):
                 lo = hi = _snap(grid.lines[a], lo)
             m.append(_range_mask(pts[a], lo, hi, grid.tol[a]))
         return m[0][:, None, None] & m[1][None, :, None] & m[2][None, None, :]
+    if isinstance(q, C.Curve):
+        return np.zeros(shape, bool)                                # a wire: on the edges of its path (find_path)
     if isinstance(q, C.Cylinder):
         p0, p1 = np.asarray(q.start), np.asarray(q.stop)
         ax = p1 - p0
         L2 = float(ax @ ax)
-        lo, hi = np.minimum(p0, p1) - q.radius, np.maximum(p0, p1) + q.radius
+        rout = q.radius + (q.shell_width / 2 if isinstance(q, C.CylindricalShell) else 0.0)
+        lo, hi = np.minimum(p0, p1) - rout, np.maximum(p0, p1) + rout
         m = [_range_mask(pts[a], lo[a], hi[a], grid.tol[a]) for a in range(3)]
         out = np.zeros(shape, bool)
         idx = [np.nonzero(x)[0] for x in m]
@@ -138,10 +141,79 @@ def inside(q, pts, grid, flat_snap=True):
         t = (P @ ax) / L2
         r2 = ((P - t[..., None] * ax) ** 2).sum(-1)
         tol = max(grid.tol) * 10
-        sub = (t >= -1e-9) & (t <= 1 + 1e-9) & (r2 <= (q.radius + tol) ** 2)
+        if isinstance(q, C.CylindricalShell):
+            sub = (t >= -1e-9) & (t <= 1 + 1e-9) & (np.abs(np.sqrt(r2) - q.radius) <= q.shell_width / 2 + tol)
+        else:
+            sub = (t >= -1e-9) & (t <= 1 + 1e-9) & (r2 <= (q.radius + tol) ** 2)
         out[np.ix_(*idx)] = sub
         return out
     raise ValueError(f"gfdtd: primitive {type(q).__name__} not supported")
+
+
+def _snap_primary(lines, c):
+    """openEMS's SnapToMeshLine on the primary mesh: the nearest line (a tie goes to the lower one)."""
+    dual = 0.5 * (lines[1:] + lines[:-1])
+    return int(min(np.searchsorted(dual, c, 'left'), len(lines) - 1))
+
+
+def _foot(P, a, b):
+    """openEMS's Point_Line_Distance: the foot of P on the line a -> b (0 at a, 1 at b) and its distance."""
+    d = b - a
+    L2 = float(d @ d)
+    t = float((P - a) @ d) / L2 if L2 > 0 else 0.0
+    return t, float(np.linalg.norm(P - (a + t * d)))
+
+
+def find_path(grid, p1, p2):
+    """[(axis, (i, j, k))] of the mesh edges along the segment p1 -> p2 (drawing units), as openEMS's FindPath: from
+    the line crossing nearest p1, each step to the neighbouring node closest to the segment and further along it."""
+    L = grid.lines
+    p1, p2 = np.asarray(p1, float), np.asarray(p2, float)
+    for a in range(3):
+        if (p1[a] < L[a][0] and p2[a] < L[a][0]) or (p1[a] > L[a][-1] and p2[a] > L[a][-1]):
+            return []
+    s = [_snap_primary(L[a], p1[a]) for a in range(3)]
+    e = [_snap_primary(L[a], p2[a]) for a in range(3)]
+    node = lambda q: np.array([L[a][q[a]] for a in range(3)])
+    cur = list(s)
+    cfoot = mfoot = _foot(node(s), p1, p2)[0]
+    stop_foot = _foot(node(e), p1, p2)[0]
+    path = []
+    while mfoot < stop_foot:
+        best = None
+        for a in range(3):
+            for step in (-1, 1):
+                q = list(cur)
+                q[a] += step
+                if not 0 <= q[a] < len(L[a]):
+                    continue
+                f, dist = _foot(node(q), p1, p2)
+                if f > cfoot and (best is None or dist < best[0]):
+                    best = (dist, f, a, step)
+        if best is None:
+            break
+        _, mfoot, a, step = best
+        lo = list(cur)
+        if step < 0:
+            lo[a] -= 1
+        cur[a] += step
+        path.append((a, tuple(lo)))
+        cfoot = mfoot
+    for a in range(3):                                              # close what is missing to the end node
+        if cur[a] > e[a]:
+            cur[a] -= 1
+            path.append((a, tuple(cur)))
+        elif cur[a] < e[a]:
+            path.append((a, tuple(cur)))
+    return path
+
+
+def curve_edges(q, grid):
+    """find_path over each segment of a Curve primitive."""
+    out = []
+    for P0, P1 in zip(q.points[:-1], q.points[1:]):
+        out += find_path(grid, P0, P1)
+    return out
 
 
 def edge_mask(q, a, grid):
@@ -277,6 +349,11 @@ def build(csx, fdtd, log=None):
     for p in props:
         if isinstance(p, (C.Metal, C.ConductingSheet)):
             for q in p.primitives:
+                if isinstance(q, C.Curve):
+                    for a, ijk in curve_edges(q, grid):
+                        if ijk[a] < sh[a] - 1:
+                            pec[(a,) + ijk] = max(pec[(a,) + ijk], q.priority)
+                    continue
                 for a in range(3):
                     m = edge_mask(q, a, grid)
                     np.maximum(pec[a], np.where(m, q.priority, -np.inf), out=pec[a])
@@ -402,21 +479,8 @@ def build(csx, fdtd, log=None):
                 raise ValueError(f"gfdtd: boundary {b} not supported (PEC, PMC, MUR, PML_n)")
     op.mur = (np.concatenate(mur0).astype(np.int64), np.concatenate(mur1).astype(np.int64),
               np.concatenate(murk)) if mur0 else None
-    # excitations: soft E sources
-    ex_idx, ex_amp = [], []
-    for p in props:
-        if isinstance(p, C.Excitation):
-            if p.exc_type != 0:
-                raise ValueError(f"gfdtd: excitation {p.name}: type {p.exc_type} not supported (only 0, soft E)")
-            for q in p.primitives:
-                for a in range(3):
-                    if p.exc_val[a] == 0:
-                        continue
-                    m = edge_mask(q, a, grid) & (vi[a] > 0)
-                    for i, j, k in zip(*np.nonzero(m)):
-                        ex_idx.append(_flat(sh, a, i, j, k))
-                        ex_amp.append(p.exc_val[a] * lE[a, i, j, k])
-    op.exc = (np.asarray(ex_idx, np.int64), np.asarray(ex_amp, float))
+    # excitations: E (types 0 soft, 1 hard) on the edges, H (2 soft, 3 hard) on the dual edges, weighted, delayed
+    op.exc, op.exc_more = _excitations(props, grid, sh, vv, vi, lE, lH, dt, op.notes)
     # probes
     op.probes = []
     for p in props:
@@ -440,7 +504,10 @@ def build(csx, fdtd, log=None):
     op.f0, op.fc = f0, fc
     n = int(2 * 9.0 / (2 * np.pi * fc) / dt)
     t = np.arange(n + 1) * dt
-    op.signal = np.cos(2 * np.pi * f0 * (t - 9.0 / (2 * np.pi * fc))) * np.exp(-(2 * np.pi * fc * t / 3 - 3) ** 2)
+    gauss = lambda t: np.cos(2 * np.pi * f0 * (t - 9.0 / (2 * np.pi * fc))) * np.exp(-(2 * np.pi * fc * t / 3 - 3) ** 2)
+    op.signal = gauss(t)
+    op.signal_h = gauss(t + dt / 2)                                # the H excitations' signal: half a step later
+    op.delay_max = max([g['delay'] for g in op.exc_more], default=0)
     nyq = max(1, int(1.0 / (2 * (f0 + fc) * dt)))
     op.nyquist = nyq
     op.sub = max(1, nyq // int(fdtd.get('oversampling', 4) or 4))
@@ -448,6 +515,75 @@ def build(csx, fdtd, log=None):
         for line in describe(op):
             log(line)
     return op
+
+
+def _excitations(props, grid, sh, vv, vi, lE, lH, dt, notes):
+    """(idx, amp) of the soft and hard E excitations without delay (one signal for all: the fast path), and
+    [dict(field 'V' | 'I', delay steps, hard, idx, amp)] of the others. Edges are taken as openEMS takes them: the
+    E edges whose midpoint, the H edges whose dual midpoint (inside the last lines) is in a primitive, curves along
+    their path; the amplitude is exc_val times the weight there times the edge's length. Hard E edges lose their
+    update (vv = vi = 0), so the signal sets them; hard H edges are set after the H update."""
+    main_i, main_a, more = [], [], {}
+    for p in props:
+        if not isinstance(p, C.Excitation):
+            continue
+        if p.exc_type not in (0, 1, 2, 3):
+            raise ValueError(f"gfdtd: excitation {p.name}: type {p.exc_type} not supported (0-3)")
+        hfield = p.exc_type >= 2
+        hard = p.exc_type in (1, 3)
+        delay = int(p.delay / dt) if p.delay > 0 else 0
+        idx, amp = [], []
+        for q in p.primitives:
+            for a in range(3):
+                if p.exc_val[a] == 0:
+                    continue
+                if isinstance(q, C.Curve):
+                    if hfield:
+                        continue
+                    hits = [ijk for b, ijk in curve_edges(q, grid) if b == a and ijk[a] < sh[a] - 1]
+                    if not hits:
+                        continue
+                    nz = tuple(np.array(v) for v in zip(*hits))
+                else:
+                    if hfield:                                      # H_a at line a, cell centres across
+                        pts = [grid.lines[b] if b == a else grid.mid[b] for b in range(3)]
+                        m = inside(q, pts, grid)
+                        m = np.pad(m, [(0, 0) if b == a else (0, 1) for b in range(3)])
+                        m[tuple(slice(sh[b] - 1, None) if b == a else slice(None) for b in range(3))] = False
+                    else:
+                        m = edge_mask(q, a, grid) & (vi[a] > 0)
+                    nz = np.nonzero(m)
+                    if not len(nz[0]):
+                        continue
+                if hfield:
+                    coords = [grid.lines[b][nz[b]] if b == a else grid.mid[b][np.minimum(nz[b], sh[b] - 2)]
+                              for b in range(3)]
+                    length = lH[a][nz]
+                else:
+                    coords = [grid.mid[b][nz[b]] if b == a else grid.lines[b][nz[b]] for b in range(3)]
+                    length = lE[a][nz]
+                w = p.weights(a, coords) * p.exc_val[a] * length
+                keep = w != 0
+                idx.append(_flat(sh, a, *(v[keep] for v in nz)))
+                amp.append(w[keep])
+                if hard and not hfield:
+                    vv[a][tuple(v[keep] for v in nz)] = 0.0
+                    vi[a][tuple(v[keep] for v in nz)] = 0.0
+        if not idx:
+            continue
+        idx, amp = np.concatenate(idx).astype(np.int64), np.concatenate(amp)
+        if not hfield and delay == 0:
+            main_i.append(idx)
+            main_a.append(amp)
+        else:
+            g = more.setdefault(('I' if hfield else 'V', delay, hard and hfield), ([], []))
+            g[0].append(idx)
+            g[1].append(amp)
+    main = (np.concatenate(main_i) if main_i else np.zeros(0, np.int64),
+            np.concatenate(main_a) if main_a else np.zeros(0))
+    groups = [dict(field=f, delay=d, hard=h, idx=np.concatenate(i), amp=np.concatenate(a_))
+              for (f, d, h), (i, a_) in sorted(more.items())]
+    return main, groups
 
 
 QUANT_BITS = 4         # compressed coefficients: low mantissa bits dropped (2^-20 relative) so that equal ones match
@@ -602,6 +738,19 @@ def _dump(p, grid, notes):
     return out
 
 
+def _current_nodes(grid, b, lo, hi):
+    """The node range (inclusive) a current probe's loop encloses across axis b, as openEMS snaps the box to the dual
+    mesh: the nodes whose dual cell overlaps (lo, hi); a flat box: the nearest node (none at a midpoint tie)."""
+    L = grid.lines[b]
+    dual = np.concatenate([[-np.inf], 0.5 * (L[1:] + L[:-1]), [np.inf]])     # node k's dual cell: dual[k] .. dual[k+1]
+    tol = grid.tol[b]
+    if hi - lo < tol:
+        k = int(np.argmin(np.abs(L - lo)))
+        return (k, k) if abs(abs(L[k] - lo) - min(abs(np.delete(L, k) - lo), default=np.inf)) > tol else (k, k - 1)
+    ks = np.nonzero((dual[1:] > lo + tol) & (dual[:-1] < hi - tol))[0]
+    return (int(ks[0]), int(ks[-1])) if len(ks) else (0, -1)
+
+
 def _probe(p, q, grid, sh):
     """dict(name, type, field 'V' | 'I', idx, w, start, stop) of a probe box: the terms whose sum is its value."""
     s = [int(np.argmin(np.abs(grid.lines[a] - q.start[a]))) for a in range(3)]
@@ -623,12 +772,13 @@ def _probe(p, q, grid, sh):
         n = p.norm_dir
         if n < 0:
             n = next(a for a in range(3) if s[a] == e[a])
-        b, c = [x for x in range(3) if x != n]
+        b, c = (n + 1) % 3, (n + 2) % 3                             # cyclic: the loop's sense is curl's
         cn = 0.5 * (q.start[n] + q.stop[n])
-        mids = grid.mid[n]
-        layer = int(np.argmin(np.abs(mids - cn)))
-        for jb in range(min(s[b], e[b]), max(s[b], e[b]) + 1):
-            for kc in range(min(s[c], e[c]), max(s[c], e[c]) + 1):
+        layer = int(np.clip(np.searchsorted(grid.lines[n], cn - grid.tol[n], 'left') - 1, 0, sh[n] - 2))
+        rb = _current_nodes(grid, b, *sorted((q.start[b], q.stop[b])))
+        rc = _current_nodes(grid, c, *sorted((q.start[c], q.stop[c])))
+        for jb in range(rb[0], rb[1] + 1):
+            for kc in range(rc[0], rc[1] + 1):
                 idx = [0, 0, 0]
                 idx[n], idx[b], idx[c] = layer, jb, kc
                 # loop sum of I around the n-edge: +I_c[.] - I_c[.-b] - I_b[.] + I_b[.-c]
@@ -641,6 +791,11 @@ def _probe(p, q, grid, sh):
                         f = _flat(sh, comp, *jdx)
                         terms[f] = terms.get(f, 0.0) + sgn * s2 * p.weight
         field = 'I'
+    elif p.p_type in (10, 11):
+        terms = _mode_match(p, grid, sh, s, e)
+        if terms is None:
+            return None
+        field = 'V' if p.p_type == 10 else 'I'
     else:
         return None
     terms = {k: v for k, v in terms.items() if v != 0}
@@ -648,6 +803,83 @@ def _probe(p, q, grid, sh):
     hi = [grid.lines[a][e[a]] for a in range(3)]
     return dict(name=p.name, type=p.p_type, field=field, idx=np.array(list(terms), np.int64),
                 w=np.array(list(terms.values()), float), start=(lo, s), stop=(hi, e), unit=grid.unit)
+
+
+def _mode_match(p, grid, sh, s, e):
+    """The terms of a mode-matching probe, as openEMS's ProcessModeMatch: on the box's plane (normal n) the
+    transverse E at the nodes (type 10, interpolated between the edges either side) or H (type 11, the average of
+    the four dual edges round the node), times the mode function normalised to unit energy (at the nodes for E, at
+    the cell centres for H, as openEMS evaluates them), times the node area. The boundary lines are left out."""
+    dual = p.p_type == 11
+    lo, hi = [min(a, b) for a, b in zip(s, e)], [max(a, b) for a, b in zip(s, e)]
+    for a in range(3):
+        if lo[a] == 0:
+            lo[a] += 1
+        if hi[a] == sh[a] - 1:
+            hi[a] -= 1
+        elif dual and hi[a] > lo[a] + 1:
+            hi[a] -= 1
+    flat = [a for a in range(3) if lo[a] == hi[a]]
+    if len(flat) != 1:
+        return None
+    n = flat[0]
+    u, v = (n + 1) % 3, (n + 2) % 3
+    disc = lambda a, i: (grid.mid[a][i] if i < sh[a] - 1 else grid.lines[a][i] + 0.5 * (grid.lines[a][i] -
+                                                                                         grid.lines[a][i - 1])) \
+        if dual else grid.lines[a][i]
+    width = lambda a, i: (grid.d[a][i] if i < sh[a] - 1 else 0.0) if dual else grid.dual[a][i]
+    iu, iv = np.arange(lo[u], hi[u] + 1), np.arange(lo[v], hi[v] + 1)
+    cu = np.array([disc(u, i) for i in iu])
+    cv = np.array([disc(v, i) for i in iv])
+    area = np.outer([width(u, i) for i in iu], [width(v, i) for i in iv])
+    coords = [None] * 3
+    U, Vv = np.meshgrid(cu, cv, indexing='ij')
+    coords[u], coords[v], coords[n] = U, Vv, np.full(U.shape, disc(n, lo[n]))
+    fu, fv = p.mode(n, coords)
+    norm = np.sqrt(((fu ** 2 + fv ** 2) * area).sum())
+    if norm == 0:
+        return None
+    fu, fv = fu / norm, fv / norm
+    terms = {}
+
+    def add(comp, ijk, w):
+        f = _flat(sh, comp, *ijk)
+        terms[f] = terms.get(f, 0.0) + w * p.weight
+
+    for x, i in enumerate(iu):
+        for y, j in enumerate(iv):
+            pos = [0, 0, 0]
+            pos[n], pos[u], pos[v] = lo[n], i, j
+            for comp, f in ((u, fu[x, y]), (v, fv[x, y])):
+                wt = f * area[x, y]
+                if wt == 0:
+                    continue
+                if not dual:                                        # E at the node: edges pos and pos-1 along comp
+                    d = grid.d[comp]
+                    k = pos[comp]
+                    if k == sh[comp] - 1:
+                        q_ = list(pos)
+                        q_[comp] -= 1
+                        add(comp, q_, wt / d[k - 1])
+                        continue
+                    if k == 0:
+                        add(comp, pos, wt / d[0])
+                        continue
+                    rel = d[k] / (d[k] + d[k - 1])
+                    add(comp, pos, wt * (1 - rel) / d[k])
+                    q_ = list(pos)
+                    q_[comp] -= 1
+                    add(comp, q_, wt * rel / d[k - 1])
+                else:                                               # H at the node: four dual edges round it
+                    cP, cPP = (comp + 1) % 3, (comp + 2) % 3
+                    if any(pos[b] == sh[b] - 1 for b in range(3)) or pos[cP] == 0 or pos[cPP] == 0:
+                        continue
+                    for dP, dPP in ((0, 0), (1, 0), (1, 1), (0, 1)):
+                        q_ = list(pos)
+                        q_[cP] -= dP
+                        q_[cPP] -= dPP
+                        add(comp, q_, wt / 4 / grid.dual[comp][q_[comp]])
+    return terms
 
 
 def describe(op):

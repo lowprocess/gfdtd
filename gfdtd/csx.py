@@ -8,10 +8,15 @@ and CSXCAD's XML format both ways, so a model built for openEMS can be built, wr
     CSX.AddMetal('cu').AddPolygon([xs, ys], 'z', 1.6, priority=10)
     CSX.Write2XML('model.xml');  CSX2 = ContinuousStructure(); CSX2.ReadFromXML('model.xml')
 
-Properties: Material, DebyeMaterial, Metal, ConductingSheet, LumpedElement, Excitation, ProbeBox, DumpBox (and
-LorentzMaterial, read with its static epsilon). Primitives: Box, Polygon, LinPoly, Cylinder. Anything else
-in a file read here is kept out of the model and listed in `CSX.skipped`.
+Properties: Material, DebyeMaterial, Metal, ConductingSheet, LumpedElement, Excitation (with weight functions or a
+mode file), ProbeBox (with mode functions or a mode file), DumpBox (and LorentzMaterial, read with its static
+epsilon). Primitives: Box, Polygon, LinPoly, Cylinder, CylindricalShell, Curve. Anything else in a file read here is
+kept out of the model and listed in `CSX.skipped`.
+
+Weight and mode functions are CSXCAD's function-parser expressions in x, y, z, rho, a, r, t (drawing units, from
+the weight origin): evaluate(expr, coords) runs them on numpy arrays.
 """
+import re
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -44,6 +49,74 @@ def _floats(text, n=None):
     if n and len(vals) == 1:
         vals *= n
     return vals
+
+
+def _special(name):
+    import scipy.special as sp
+    return getattr(sp, name)
+
+
+_FUNCS = dict(sin=np.sin, cos=np.cos, tan=np.tan, asin=np.arcsin, acos=np.arccos, atan=np.arctan, atan2=np.arctan2,
+              sinh=np.sinh, cosh=np.cosh, tanh=np.tanh, asinh=np.arcsinh, acosh=np.arccosh, atanh=np.arctanh,
+              exp=np.exp, log=np.log, log10=np.log10, log2=np.log2, sqrt=np.sqrt, cbrt=np.cbrt, abs=np.abs,
+              floor=np.floor, ceil=np.ceil, trunc=np.trunc, int=np.rint, min=np.minimum, max=np.maximum,
+              pow=np.power, hypot=np.hypot, sec=lambda v: 1 / np.cos(v), csc=lambda v: 1 / np.sin(v),
+              cot=lambda v: 1 / np.tan(v), pi=np.pi,
+              j0=lambda v: _special('j0')(v), j1=lambda v: _special('j1')(v), jn=lambda n, v: _special('jv')(n, v),
+              y0=lambda v: _special('y0')(v), y1=lambda v: _special('y1')(v), yn=lambda n, v: _special('yv')(n, v),
+              **{'if': None})
+
+
+def _fparser_to_python(expr):
+    """A CSXCAD (fparser) expression as a numpy one: ^ is the power, = equality, & | logical and / or, if(c, a, b)."""
+    e = str(expr).strip()
+    e = e.replace('^', '**')
+    e = re.sub(r'(?<![<>!=])=(?!=)', '==', e)
+    e = e.replace('&', ' * ').replace('|', ' + ')                    # on 0 / 1 values; | then clipped below
+    e = re.sub(r'\bif\s*\(', '_if(', e)
+    return e
+
+
+def evaluate(expr, coords):
+    """A weight / mode function on arrays: coords = (x, y, z) relative to its origin (drawing units). Returns an array
+    broadcast to the coordinates; nan and inf become 0, as openEMS's mode matching does."""
+    x, y, z = (np.asarray(c, float) for c in coords)
+    x, y, z = np.broadcast_arrays(x, y, z)
+    if expr is None or str(expr).strip() in ('', '0'):
+        return np.zeros(x.shape)
+    rho = np.sqrt(x * x + y * y)
+    with np.errstate(all='ignore'):
+        ns = dict(_FUNCS, x=x, y=y, z=z, rho=rho, a=np.arctan2(y, x), r=np.sqrt(x * x + y * y + z * z),
+                  t=np.arcsin(1) - np.arctan(z / rho),
+                  _if=lambda c, a, b: np.where(np.asarray(c) != 0, a, b))
+        ns.pop('if')
+        v = eval(compile(_fparser_to_python(expr), '<weight function>', 'eval'), {'__builtins__': {}}, ns)
+        v = np.broadcast_to(np.asarray(v, float), x.shape).copy()
+    v[~np.isfinite(v)] = 0.0
+    return v
+
+
+def read_mode_file(path):
+    """openEMS's mode file (HDF5): 1-D 'x', 'y' (the two transverse axes) and 2-D 'Vx', 'Vy' on them."""
+    import h5py
+    with h5py.File(path, 'r') as f:
+        if float(f.attrs.get('Version', 0)) < 1.0:
+            raise ValueError(f"{path}: not a mode file (no Version >= 1)")
+        return tuple(np.asarray(f[k], float) for k in ('x', 'y', 'Vx', 'Vy'))
+
+
+def mode_file_values(data, u, v):
+    """(Vx, Vy) of a mode file bilinearly interpolated at (u, v), clamped to its grid (CSModeData::LinInterp2)."""
+    X, Y, A, B = data
+    u = np.clip(np.asarray(u, float), X[0], X[-1])
+    v = np.clip(np.asarray(v, float), Y[0], Y[-1])
+    i = np.clip(np.searchsorted(X, u, 'left') - 1, 0, len(X) - 2)
+    j = np.clip(np.searchsorted(Y, v, 'left') - 1, 0, len(Y) - 2)
+    x1, x2, y1, y2 = X[i], X[i + 1], Y[j], Y[j + 1]
+    D = 1.0 / ((x2 - x1) * (y2 - y1))
+    f = lambda M: D * (M[i, j] * (x2 - u) * (y2 - v) + M[i + 1, j] * (u - x1) * (y2 - v) +
+                       M[i, j + 1] * (x2 - u) * (v - y1) + M[i + 1, j + 1] * (u - x1) * (v - y1))
+    return f(A), f(B)
 
 
 class CSRectGrid:
@@ -137,6 +210,28 @@ class Cylinder(Primitive):
         self.start, self.stop, self.radius = _vec(start), _vec(stop), _num(radius)
 
 
+class CylindricalShell(Cylinder):
+    """The points whose distance from the axis start -> stop is within shell_width / 2 of radius."""
+    kind = 'CylindricalShell'
+
+    def __init__(self, prop, start, stop, radius, shell_width, priority=0):
+        super().__init__(prop, start, stop, radius, priority)
+        self.shell_width = _num(shell_width)
+
+
+class Curve(Primitive):
+    """A polyline (points: [xs, ys, zs], as CSXCAD's): a wire along the mesh edges nearest to it in metals and
+    excitations."""
+    kind = 'Curve'
+
+    def __init__(self, prop, points, priority=0):
+        super().__init__(prop, priority)
+        self.points = np.asarray(points, float).reshape(3, -1).T    # CSXCAD's layout: [xs, ys, zs]; kept N x 3
+
+    def GetNumberOfPoints(self):
+        return len(self.points)
+
+
 class Property:
     """A CSXCAD property: its type (the XML tag), name, attributes and primitives."""
     kind = ''
@@ -174,6 +269,12 @@ class Property:
 
     def AddCylinder(self, start, stop, radius, priority=0, **kw):
         return self._add(Cylinder(self, start, stop, radius, priority))
+
+    def AddCylindricalShell(self, start, stop, radius, shell_width, priority=0, **kw):
+        return self._add(CylindricalShell(self, start, stop, radius, shell_width, priority))
+
+    def AddCurve(self, points, priority=0, **kw):
+        return self._add(Curve(self, points, priority))
 
     def __repr__(self):
         return f"{self.kind}({self.name!r}, {len(self.primitives)} primitive(s))"
@@ -242,25 +343,118 @@ class LumpedElement(Property):
 
 
 class Excitation(Property):
-    """exc_type 0: soft E field (a voltage source on the edges in its box), 1: soft H field; exc_val: the E (V/m)
-    or H vector it adds, times the excitation signal."""
+    """exc_type 0: soft E field (added to the edges in its primitives), 1: hard E field (the edges set to it), 2: soft
+    H field, 3: hard H field; exc_val: the E (V/m) or H (A/m) vector, times the excitation signal, delay seconds late.
+    A weight function per component (SetWeightFunction, in x, y, z, rho, a, r, t from SetWeightOrigin) or a mode
+    file (SetWeightFile, with SetPropagationDir) scales it across the primitives."""
     kind = 'Excitation'
 
     def __init__(self, name, exc_type=0, exc_val=(0, 0, 0), delay=0.0, number=0, **kw):
         super().__init__(name)
         self.exc_type, self.exc_val, self.delay, self.number = int(exc_type), _vec(exc_val), _num(delay), int(number)
+        self.weight = ['1', '1', '1']
+        self.weight_file, self.weight_origin, self.prop_dir = '', [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+
+    def SetExcitation(self, val):
+        self.exc_val = _vec(val)
+
+    def GetExcitation(self):
+        return list(self.exc_val)
+
+    def SetDelay(self, val):
+        self.delay = _num(val)
+
+    def GetDelay(self):
+        return self.delay
+
+    def SetExcitType(self, val):
+        self.exc_type = int(val)
+
+    def GetExcitType(self):
+        return self.exc_type
+
+    def SetEnabled(self, val):
+        self.enabled = bool(val)
+
+    def GetEnabled(self):
+        return self.enabled
+
+    def SetWeightFunction(self, func):
+        self.weight = [str(f) for f in func]
+        self.weight_file = ''
+
+    def GetWeightFunction(self):
+        return list(self.weight)
+
+    def SetWeightFile(self, path):
+        self.weight_file = str(path)
+
+    def SetWeightOrigin(self, origin):
+        self.weight_origin = _vec(origin)
+
+    def SetPropagationDir(self, val):
+        self.prop_dir = _vec(val)
+
+    def weights(self, a, coords):
+        """The weight of component a at coords (x, y, z arrays, drawing units)."""
+        x, y, z = (np.asarray(c, float) - o for c, o in zip(coords, self.weight_origin))
+        if self.weight_file:
+            n = int(np.argmax(np.abs(self.prop_dir)))
+            if not np.count_nonzero(self.prop_dir) == 1:
+                raise ValueError(f"excitation {self.name}: a mode file needs one propagation direction")
+            if a == n:
+                return np.zeros(np.broadcast(x, y, z).shape)
+            loc = (x, y, z)
+            vx, vy = mode_file_values(read_mode_file(self.weight_file), loc[(n + 1) % 3], loc[(n + 2) % 3])
+            return vy if a == (n + 2) % 3 else vx
+        return evaluate(self.weight[a], (x, y, z))
 
 
 class ProbeBox(Property):
     """p_type 0: voltage (the E integral from start to stop), 1: current (the H loop around the box, normal
-    norm_dir); the probe's value is multiplied by weight. Written to a file of its name."""
+    norm_dir), 10 / 11: voltage / current mode matching (the transverse E / H on the box's plane against a mode
+    function or mode file, as openEMS's waveguide ports); the probe's value is multiplied by weight. Written to a
+    file of its name."""
     kind = 'ProbeBox'
 
-    def __init__(self, name, p_type=0, weight=1.0, norm_dir=-1, **kw):
+    def __init__(self, name, p_type=0, weight=1.0, norm_dir=-1, mode_function=None, frequency=None, **kw):
         super().__init__(name)
         self.p_type, self.weight = int(p_type), _num(weight)
         self.norm_dir = -1 if norm_dir is None or (not isinstance(norm_dir, str) and int(norm_dir) < 0) else ny_dir(norm_dir)
+        self.mode_function = ['', '', ''] if mode_function is None else [str(f) for f in mode_function]
+        self.mode_file, self.mode_origin = '', [0.0, 0.0, 0.0]
+        self.frequency = [] if frequency is None else _vec(frequency)
         self.extra = {k: v for k, v in kw.items()}
+
+    def GetProbeType(self):
+        return self.p_type
+
+    def SetModeFunction(self, func):
+        self.mode_function = [str(f) for f in func]
+
+    def GetModeFunction(self, ny):
+        return self.mode_function[ny]
+
+    def SetModeFile(self, path):
+        self.mode_file = str(path)
+
+    def GetModeFile(self):
+        return self.mode_file
+
+    def SetModeOrigin(self, origin):
+        self.mode_origin = _vec(origin)
+
+    def GetModeOrigin(self, ny):
+        return self.mode_origin[ny]
+
+    def mode(self, n, coords):
+        """The mode's two transverse components on a plane normal to axis n, at coords (drawing units): axes (n+1)%3
+        and (n+2)%3, from the mode file (its Vx, Vy at those axes' local coordinates) or the expressions."""
+        loc = [np.asarray(c, float) - o for c, o in zip(coords, self.mode_origin)]
+        u, v = (n + 1) % 3, (n + 2) % 3
+        if self.mode_file:
+            return mode_file_values(read_mode_file(self.mode_file), loc[u], loc[v])
+        return evaluate(self.mode_function[u], loc), evaluate(self.mode_function[v], loc)
 
 
 class DumpBox(Property):
@@ -440,10 +634,15 @@ def _write_property(parent, p, pid):
         a['LEtype'] = _fmt(p.LEtype)
     elif isinstance(p, Excitation):
         a.update(Number=str(p.number), Enabled='1' if p.enabled else '0', Frequency=_fmt(0), Delay=_fmt(p.delay),
-                 Type=str(p.exc_type), Excite=",".join(_fmt(v) for v in p.exc_val), PropDir=",".join([_fmt(0)] * 3))
+                 Type=str(p.exc_type), Excite=",".join(_fmt(v) for v in p.exc_val),
+                 PropDir=",".join(_fmt(v) for v in p.prop_dir))
+        if p.weight_file:
+            a['WeightFile'] = p.weight_file
     elif isinstance(p, ProbeBox):
         a.update(Visible='0', Number='0', Type=str(p.p_type), Weight=f"{p.weight:g}", NormDir=str(p.norm_dir),
                  StartTime='0', StopTime='0')
+        if p.mode_file:
+            a['ModeFile'] = p.mode_file
     elif isinstance(p, DumpBox):
         a.update(Visible='0', Number='0', Type='0', Weight='1', NormDir='-1', StartTime='0', StopTime='0',
                  DumpType=str(p.dump_type), DumpMode=str(p.dump_mode), FileType=str(p.file_type), MultiGridLevel='0')
@@ -463,7 +662,16 @@ def _write_property(parent, p, pid):
                 pa[f"EpsilonRelaxTime_{o + 1}"] = _three(d.get('eps_relax', 0.0))
         ET.SubElement(el, 'Property', **pa)
     if isinstance(p, Excitation):
-        ET.SubElement(el, 'Weight', X=_fmt(1), Y=_fmt(1), Z=_fmt(1))
+        if any(p.weight_origin):
+            ET.SubElement(el, 'WeightOrigin', **dict(zip('XYZ', (_fmt(v) for v in p.weight_origin))))
+        ET.SubElement(el, 'Weight', **dict(zip('XYZ', p.weight)))
+    if isinstance(p, ProbeBox) and not isinstance(p, DumpBox):
+        if p.frequency:
+            ET.SubElement(el, 'FD_Samples').text = ",".join(f"{f:.15g}" for f in p.frequency)
+        if any(p.mode_function):
+            ET.SubElement(el, 'ModeFunction', **dict(zip('XYZ', p.mode_function)))
+        if any(p.mode_origin):
+            ET.SubElement(el, 'ModeOrigin', **dict(zip('XYZ', (_fmt(v) for v in p.mode_origin))))
     if isinstance(p, DumpBox) and p.frequency:
         ET.SubElement(el, 'FD_Samples').text = ",".join(f"{f:.15g}" for f in p.frequency)
 
@@ -475,9 +683,14 @@ def _write_primitive(parent, q):
         ET.SubElement(el, 'P1', X=_fmt(q.start[0]), Y=_fmt(q.start[1]), Z=_fmt(q.start[2]))
         ET.SubElement(el, 'P2', X=_fmt(q.stop[0]), Y=_fmt(q.stop[1]), Z=_fmt(q.stop[2]))
     elif isinstance(q, Cylinder):
-        el = ET.SubElement(parent, 'Cylinder', **pr, Radius=_fmt(q.radius))
+        extra = dict(ShellWidth=_fmt(q.shell_width)) if isinstance(q, CylindricalShell) else {}
+        el = ET.SubElement(parent, q.kind, **pr, Radius=_fmt(q.radius), **extra)
         ET.SubElement(el, 'P1', X=_fmt(q.start[0]), Y=_fmt(q.start[1]), Z=_fmt(q.start[2]))
         ET.SubElement(el, 'P2', X=_fmt(q.stop[0]), Y=_fmt(q.stop[1]), Z=_fmt(q.stop[2]))
+    elif isinstance(q, Curve):
+        el = ET.SubElement(parent, 'Curve', **pr)
+        for P in q.points:
+            ET.SubElement(el, 'Vertex', X=_fmt(P[0]), Y=_fmt(P[1]), Z=_fmt(P[2]))
     else:                                                           # Polygon, LinPoly
         a = dict(pr, Elevation=_fmt(q.elevation), NormDir=str(q.norm_dir), QtyVertices=str(q.points.shape[1]))
         if isinstance(q, LinPoly):
@@ -526,8 +739,23 @@ def _read_property(pe, skipped):
         p = Excitation(name, int(pe.get('Type', 0)), _floats(pe.get('Excite', '0,0,0'), 3), float(pe.get('Delay', 0)),
                        number=int(pe.get('Number', 0)))
         p.enabled = pe.get('Enabled', '1') != '0'
+        p.prop_dir = _floats(pe.get('PropDir', '0,0,0'), 3)
+        p.weight_file = pe.get('WeightFile', '')
+        w, wo = pe.find('Weight'), pe.find('WeightOrigin')
+        if w is not None and not p.weight_file:
+            p.weight = [w.get(k, '1') for k in 'XYZ']
+        if wo is not None:
+            p.weight_origin = [float(wo.get(k, 0)) for k in 'XYZ']
     elif tag == 'ProbeBox':
         p = ProbeBox(name, int(pe.get('Type', 0)), float(pe.get('Weight', 1)), int(pe.get('NormDir', -1)))
+        p.mode_file = pe.get('ModeFile', '')
+        mf, mo, fd = pe.find('ModeFunction'), pe.find('ModeOrigin'), pe.find('FD_Samples')
+        if mf is not None:
+            p.mode_function = [mf.get(k, '') for k in 'XYZ']
+        if mo is not None:
+            p.mode_origin = [float(mo.get(k, 0)) for k in 'XYZ']
+        if fd is not None and (fd.text or '').strip():
+            p.frequency = _floats(fd.text)
     elif tag == 'DumpBox':
         fd = pe.find('FD_Samples')
         sub_s = pe.get('SubSampling')
@@ -545,6 +773,11 @@ def _read_property(pe, skipped):
             p.AddBox(_point(q.find('P1')), _point(q.find('P2')), priority=pri)
         elif q.tag == 'Cylinder':
             p.AddCylinder(_point(q.find('P1')), _point(q.find('P2')), float(q.get('Radius')), priority=pri)
+        elif q.tag == 'CylindricalShell':
+            p.AddCylindricalShell(_point(q.find('P1')), _point(q.find('P2')), float(q.get('Radius')),
+                                  float(q.get('ShellWidth')), priority=pri)
+        elif q.tag == 'Curve':
+            p.AddCurve(np.array([_point(v) for v in q.findall('Vertex')]).T, priority=pri)
         elif q.tag in ('Polygon', 'LinPoly'):
             vs = [(float(v.get('X1')), float(v.get('X2'))) for v in q.findall('Vertex')]
             pts = [np.array([u for u, _ in vs]), np.array([w for _, w in vs])]

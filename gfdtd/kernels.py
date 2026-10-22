@@ -8,7 +8,7 @@ the energy as a block reduction, and the sparse kernels on flat indices into the
 """
 import os
 
-NAMES = ('update_h', 'update_e', 'energy', 'mur_pre', 'mur_post', 'excite', 'par_l', 'series_rlc', 'probe',
+NAMES = ('update_h', 'update_e', 'energy', 'mur_pre', 'mur_post', 'excite', 'assign', 'par_l', 'series_rlc', 'probe',
          'pml_e', 'pml_h', 'step_h', 'step_e', 'step_post', 'dump')
 SLAB = 6                # the PML kernels' slab table: start, m, axis, s0, cnt, offset of b / c, per slab
 
@@ -101,6 +101,12 @@ extern "C" __global__ void excite(float* V, const idx_t* idx, const float* amp, 
 {
     idx_t e = blockIdx.x * (idx_t)blockDim.x + threadIdx.x;
     if (e < m) atomicAdd(&V[idx[e]], amp[e] * s);
+}
+
+extern "C" __global__ void assign(float* V, const idx_t* idx, const float* amp, float s, idx_t m)
+{
+    idx_t e = blockIdx.x * (idx_t)blockDim.x + threadIdx.x;
+    if (e < m) V[idx[e]] = amp[e] * s;
 }
 
 extern "C" __global__ void par_l(float* V, const float* vi, const idx_t* idx, const float* k, float* IL, idx_t m)

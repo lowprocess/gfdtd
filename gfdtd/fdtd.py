@@ -1,5 +1,6 @@
 """
-openEMS's Python interface over gfdtd's engine: the FDTD settings, lumped ports and Run, so a script (or
+openEMS's Python interface over gfdtd's engine: the FDTD settings, the ports (lumped here; MSL, stripline, CPW,
+coaxial, waveguide and curve ports in gfdtd.ports) and Run, so a script (or
 kicad2ems's build_fdtd) written for openEMS runs here by swapping the two imports:
 
     from gfdtd import ContinuousStructure, openEMS
@@ -17,6 +18,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 from . import csx as C
+from . import ports as P
 
 BC_NAMES = {0: 'PEC', 1: 'PMC', 2: 'MUR', 3: 'PML_8'}
 SIDES = ('xmin', 'xmax', 'ymin', 'ymax', 'zmin', 'zmax')
@@ -68,6 +70,42 @@ class openEMS:                                                       # noqa: N80
         port = LumpedPort(self.csx, port_nr, R, start, stop, p_dir, excite, **kw)
         self.ports.append(port)
         return port
+
+    def _add(self, cls, *args, **kw):
+        if self.csx is None:
+            raise ValueError("gfdtd: SetCSX before adding ports")
+        port = cls(self.csx, *args, **kw)
+        self.ports.append(port)
+        return port
+
+    def AddCurvePort(self, port_nr, R, start, stop, excite=0, **kw):
+        return self._add(P.CurvePort, port_nr, R, start, stop, excite=excite, **kw)
+
+    def AddMSLPort(self, port_nr, metal_prop, start, stop, prop_dir, exc_dir, excite=0, **kw):
+        return self._add(P.MSLPort, port_nr, metal_prop, start, stop, prop_dir, exc_dir, excite=excite, **kw)
+
+    def AddStripLinePort(self, port_nr, metal_prop, start, stop, prop_dir, exc_dir, height, excite=0, **kw):
+        return self._add(P.StripLinePort, port_nr, metal_prop, start, stop, prop_dir, exc_dir, height, excite=excite,
+                         **kw)
+
+    def AddCPWPort(self, port_nr, metal_prop, start, stop, prop_dir, exc_dir, gap_width, excite=0, **kw):
+        return self._add(P.CPWPort, port_nr, metal_prop, start, stop, prop_dir, exc_dir, gap_width, excite=excite, **kw)
+
+    def AddCoaxialPort(self, port_nr, pec_prop, mat_prop, start, stop, prop_dir, r_i, r_o, r_os, excite=0, **kw):
+        return self._add(P.CoaxialPort, port_nr, pec_prop, mat_prop, start, stop, prop_dir, r_i, r_o, r_os,
+                         excite=excite, **kw)
+
+    def AddWaveGuidePort(self, port_nr, start, stop, p_dir, E_func=None, H_func=None, kc=0.0, excite=0, excite_type=0,
+                         E_file=None, H_file=None, **kw):
+        return self._add(P.WaveguidePort, port_nr, start, stop, p_dir, E_func, H_func, kc, excite=excite,
+                         excite_type=excite_type, E_WG_file=E_file, H_WG_file=H_file, **kw)
+
+    def AddRectWaveGuidePort(self, port_nr, start, stop, p_dir, a, b, mode_name, excite=0, **kw):
+        return self._add(P.RectWGPort, port_nr, start, stop, p_dir, a, b, mode_name, excite=excite, **kw)
+
+    def AddCircWaveGuidePort(self, port_nr, start, stop, exc_dir, radius, mode_name, pol_ang=0, excite=0, **kw):
+        return self._add(P.CircWGPort, port_nr, start, stop, exc_dir, radius, mode_name, pol_ang=pol_ang,
+                         excite=excite, **kw)
 
     def settings(self):
         if self.excitation is None:
@@ -226,8 +264,8 @@ class LumpedPort:
         if excite != 0:
             vec = np.zeros(3)
             vec[a] = -1 * self.direction * excite
-            CSX.AddExcitation(lbl.format('excite'), exc_type=0, exc_val=vec).AddBox(self.start, self.stop,
-                                                                                    priority=self.priority)
+            CSX.AddExcitation(lbl.format('excite'), exc_type=0, exc_val=vec, delay=kw.get('delay', 0)).AddBox(
+                self.start, self.stop, priority=self.priority)
         mid = 0.5 * (self.start + self.stop)
         u0, u1 = mid.copy(), mid.copy()
         u0[a], u1[a] = self.start[a], self.stop[a]
