@@ -5,8 +5,8 @@
 gfdtd is a 3D FDTD solver written for kicad2ems, in the manner of openEMS, that runs on a GPU, or on the CPU
 through a compiled core. It is bundled in this repository (the `gfdtd` package, beside `mom25d`). Name it
 (`--solvers gfdtd`) or tick it under Solvers in the GUI, where its section (Runs on: auto, gpu, cpu) follows
-openEMS's: it uses openEMS's mesh and run settings. `--solvers auto` doesn't pick it (auto picks openEMS for
-this model).
+openEMS's: it uses openEMS's mesh and run settings. `--solvers auto` picks it over openEMS whenever it can run:
+not with `--sigma`, `--converge` or `--drive`, which it would ignore (see [Which solver](usage.md#which)).
 
 It gets **openEMS's model**: kicad2ems builds the CSXCAD geometry with the same code (`build_fdtd`), through
 gfdtd's copy of CSXCAD's and openEMS's Python interface. The mesh, boundaries, ports, parts, excitation and

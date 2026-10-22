@@ -603,7 +603,7 @@ def test_command_line_runs_an_xml(tmp_path, capsys):
 def test_plugin_registered():
     from kicad2ems.solvers import registry, get
     sv = registry()['gfdtd']
-    assert get('gpu-fdtd') is sv and not sv.in_auto and not sv.in_all
+    assert get('gpu-fdtd') is sv and sv.in_auto and not sv.in_all
     assert sv.check()[0]                                              # numpy at worst
     assert sv.capabilities['antenna'].startswith('yes')
     assert [o.key for o in sv.options] == ['gfdtd_backend']
