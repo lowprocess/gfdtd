@@ -1,45 +1,28 @@
-# gfdtd (GPU FDTD)
+# gfdtd
 
-[← Index](index.md)
+A 3D FDTD solver in the manner of openEMS that runs on a GPU (CuPy: NVIDIA CUDA or AMD ROCm), or on the CPU
+through a compiled core, with numpy as the fallback and the reference. It reads openEMS's models: a script
+written for openEMS's Python interface runs here by swapping two imports, and `gfdtd model.xml` runs an openEMS
+XML file as `openEMS model.xml` does. Neither openEMS nor CSXCAD needs to be installed.
 
-gfdtd is a 3D FDTD solver written for kicad2ems, in the manner of openEMS, that runs on a GPU, or on the CPU
-through a compiled core. It is bundled in this repository (the `gfdtd` package, beside `mom25d`). Name it
-(`--solvers gfdtd`) or tick it under Solvers in the GUI, where its section (Runs on: auto, gpu, cpu) follows
-openEMS's: it uses openEMS's mesh and run settings. `--solvers auto` picks it over openEMS whenever it can run:
-not with `--sigma`, `--converge` or `--drive`, which it would ignore (see [Which solver](usage.md#which)). In
-the GUI those settings are in the *openEMS + gfdtd (FDTD)* section. A preview with gfdtd and without openEMS
-draws the mesh (`<name>_mesh.png`, and the grid in the Viewer's 3D view).
+On one mid-range GPU gfdtd runs 8–20 times faster than openEMS on a 24-thread CPU; its CPU core, on that same
+CPU, about twice as fast, and five times with PML and wideband dielectrics (see [Speed](#speed)). It was written
+as a solver for [kicad2ems](https://github.com/lowprocess/kicad2ems) (KiCad boards to S-parameters, `--solvers
+gfdtd`), which builds openEMS's model of a board and runs it here.
 
-It gets **openEMS's model**: kicad2ems builds the CSXCAD geometry with the same code (`build_fdtd`), through
-gfdtd's copy of CSXCAD's and openEMS's Python interface. The mesh, boundaries, ports, parts, excitation and
-end criteria are openEMS's and take openEMS's settings (`--res`, `--fine`, `--nz`, `--bc`, `--end-db`,
-`--end-on`, `--max-steps`, `--excite`, `--diel`, `--dump`, `--dump-port`, antenna mode's `--ff-freq`,
-`--ff-step`). Only the engine differs. On the examples below the two agree to within 0.004–0.05 in |S|. On one
-mid-range GPU gfdtd runs 8–20 times faster than openEMS on a 24-thread CPU; its CPU core, on that same CPU, about
-twice as fast, and five times with PML and wideband dielectrics (see [Speed](#speed)).
+## Install
 
 ```bash
-kicad2ems examples/rf_coupler.toml --solvers gfdtd              # the GPU when CuPy finds one, else the CPU
-kicad2ems examples/rf_coupler.toml --solvers openems,gfdtd      # both, compared in the report
-kicad2ems board.toml --solvers gfdtd --gfdtd-backend cpu        # the CPU core (numpy without it: slow)
-kicad2ems board.toml --solvers gfdtd --bc PML_8 --diel wideband --dump "E@F.Cu-0.05@2,4"
-kicad2ems examples/antenna_dipole.toml --solvers gfdtd          # antenna mode: gain, efficiency, patterns
-```
-
-| Setting | Meaning |
-|---|---|
-| `--gfdtd-backend auto\|gpu\|cpu` (`[solver.gfdtd] backend`) | `auto` (default): the GPU when CuPy finds one, else the CPU. `gpu`: CuPy (CUDA or ROCm), or the run stops. `cpu`: the compiled core, else numpy |
-
-The GPU needs CuPy for your stack: one of the `gpu-*` extras (`pip install '.[gpu-rocm7]'`), as for mom25d
-([GPU](mom.md#gpu)). The CPU core is built once, as mom25d's (g++ with OpenMP, and pybind11: the `core`
-extra):
-
-```bash
+pip install .                       # numpy, scipy, shapely, h5py
+pip install '.[gpu-rocm7]'          # the GPU: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
+pip install '.[core]'               # pybind11, then build the CPU core (g++ with OpenMP):
 python -m gfdtd.core.build          # gfdtd/_core*.so; GFDTD_ARCH=-march=x86-64-v3 for a portable build
 ```
 
-Without it the CPU runs on numpy, some 15 times slower. `kicad2ems --check` shows which one gfdtd will use.
-`GFDTD_BACKEND=cupy|core|numpy` overrides the choice for every run.
+The CuPy extras conflict: install one. The CUDA wheels need the NVIDIA driver; the ROCm wheel the ROCm 7 runtime.
+Without the core the CPU runs on numpy, some 15 times slower. The backend is picked per run (`backend='auto'`:
+the GPU when CuPy finds one, else the core, else numpy); `GFDTD_BACKEND=cupy|core|numpy` overrides it for every
+run.
 
 ## CSXCAD and openEMS compatibility
 
@@ -66,9 +49,8 @@ gfdtd model.xml --path run/        # an openEMS XML file (FDTD.Write2XML), as `o
 A run writes what openEMS writes, in openEMS's formats: its status lines (`[@ 4s] Timestep: ... || Speed: ...
 || Energy: ...`), the probe files `port_ut_N` / `port_it_N`, the excitation `et` and the field dumps
 (`<name>_<step>.vtr` frames, `<name>.h5`). A file `ABORT` in the
-run folder ends a run. So kicad2ems's progress lines, port watch (`--end-on ports`), Stop and S-parameter
-code work on gfdtd unchanged. Each kicad2ems run also writes `<name>_gfdtd.xml`, the model as an openEMS XML
-file that both `gfdtd` and `openEMS` can run.
+run folder ends a run. So tools written for openEMS's run folders (kicad2ems's progress lines, port watch,
+Stop and S-parameter code among them) work on gfdtd unchanged.
 
 ## What it models
 
@@ -211,6 +193,9 @@ capacitor). A filter of lumped parts rings in them, and on the field's energy al
 
 ## Accuracy and speed
 
+The board comparisons below were run through kicad2ems (`--solvers openems,gfdtd`: the same model and mesh on both
+engines); its flags name the settings.
+
 **PML, Debye, dumps.** A microstrip on a strongly dispersive substrate (eps_inf 3, one pole of 1.5 at 30 ps), PML
 on five sides. Debye is checked against a plain material of the same complex epsilon at 5 GHz, where the two
 must agree: gfdtd's Debye run gives S21 −4.240 dB / 40.9°, its plain run −4.235 dB / 41.0°, and openEMS's plain
@@ -246,7 +231,7 @@ On demo_lowpass, openEMS's field energy stalled above `--end-db`, and the port w
 205,000 timesteps. gfdtd's energy, the lumped parts' included, fell to −40 dB after 26,900 timesteps. The CPU
 core's S-parameters are the GPU's within 1e-6.
 
-**The engine alone** (`python tools/bench_gfdtd.py`): a microstrip on a Debye substrate, PML (or Mur) on five
+**The engine alone** (`python tools/bench.py`): a microstrip on a Debye substrate, PML (or Mur) on five
 sides, per timestep, in M cell updates per second. "First version" is the dense-coefficient GPU engine with PML:
 
 | Cells | GPU, first version | GPU, PML | GPU, Mur | CPU core, PML / Mur | numpy |
@@ -294,10 +279,10 @@ gfdtd/
   nf2ff.py      the far field: openEMS's NF2FF box, CalcNF2FF and its result file
   kernels.py    the GPU kernels around core/fdtd_core.h
   core/         fdtd_core.h (the update code, GPU and CPU), gfdtd_core.cpp (the CPU core), build.py
-kicad2ems/solvers/gfdtd.py   the solver plugin (openEMS's plugin, run on gfdtd)
 tests/test_gfdtd.py          compatibility, operator, physics on small models, the far field, GPU and core
                              against numpy
 tests/test_gfdtd_ports.py    the ports, weighted / hard / H / delayed excitations, mode matching, shells,
                              curves, current-probe snapping
-tools/bench_gfdtd.py         the engine's per-operation timings by backend and model size
+tests/openems_files.py       readers of the openEMS files a run writes, for the tests
+tools/bench.py               the engine's per-operation timings by backend and model size
 ```

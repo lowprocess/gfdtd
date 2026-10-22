@@ -1,7 +1,7 @@
 """
 Hot-loop benchmark of gfdtd's engine: the time per timestep of each operation, by backend and model size.
 
-    python tools/bench_gfdtd.py [--backends cupy,core,numpy] [--sizes 0.1,1,4,16] [--steps 200] [--bc PML_8]
+    python tools/bench.py [--backends cupy,core,numpy] [--sizes 0.1,1,4,16] [--steps 200] [--bc PML_8]
 
 The model is a microstrip on a Debye substrate (one pole), two ports and a series RLC part, with PML (or --bc) on
 five sides and PEC below: about N million cells, x : y : z = 4 : 2 : 1. "wall" is the engine's own step (the GPU's:

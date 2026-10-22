@@ -189,7 +189,6 @@ def test_msl_port_on_a_through_line(tmp_path):
     """Two MSL ports on a 1.5 mm strip over 0.8 mm (er 4.4): the line's impedance from the probes is the
     closed form's (Hammerstad-Jensen; within 8 %: zero-thickness copper on a 0.25 mm mesh), and on it the line
     matches and goes through."""
-    from kicad2ems.solvers.lines.tlines import microstrip
     h, w, L = 0.8, 1.5, 40.0
     F, csx = _fdtd(5e9, 4e9, ['MUR', 'MUR', 'MUR', 'MUR', 'PEC', 'MUR'])
     g = csx.GetGrid()
@@ -207,7 +206,7 @@ def test_msl_port_on_a_through_line(tmp_path):
     f = np.linspace(1e9, 6e9, 11)
     for p in (p1, p2):
         p.CalcPort(path, f)
-    z_line = microstrip(w, h, 4.4)[0]
+    z_line = 50.62                                                    # Hammerstad-Jensen, w 1.5, h 0.8, er 4.4
     np.testing.assert_allclose(np.real(p1.Z_ref), z_line, rtol=0.08)
     p1.CalcPort(path, f, ref_impedance=p1.Z_ref)
     p2.CalcPort(path, f, ref_impedance=p1.Z_ref)

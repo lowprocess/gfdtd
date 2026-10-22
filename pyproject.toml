@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gfdtd"
+dynamic = ["version"]
+description = "A 3D FDTD solver in the manner of openEMS, on the GPU (CuPy) or a compiled CPU core; runs openEMS's models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "GPL-3.0-or-later"}
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+authors = [{ name = "Claude", email = "noreply@anthropic.com" }]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",                 # Bessel functions of the circular waveguide modes
+    "shapely>=2.0",
+    "h5py>=3",                     # frequency-domain dumps, NF2FF results
+]
+
+[project.optional-dependencies]
+core = ["pybind11>=2.10"]          # python -m gfdtd.core.build: the compiled CPU core (~15x numpy)
+# the GPU: the CuPy wheel built for your GPU stack, one of these extras (they conflict: install one)
+gpu-cuda12 = ["cupy-cuda12x>=14"]   # NVIDIA, CUDA 12.x driver
+gpu-cuda13 = ["cupy-cuda13x>=14"]   # NVIDIA, CUDA 13.x driver
+gpu-rocm7 = ["cupy-rocm-7-0>=14"]   # AMD, ROCm 7.0
+test = ["pytest>=7"]
+
+[project.scripts]
+gfdtd = "gfdtd.fdtd:main"           # run an openEMS XML file, as `openEMS model.xml`
+
+[tool.setuptools.dynamic]
+version = {attr = "gfdtd.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["gfdtd*"]
+
+[tool.setuptools.package-data]
+gfdtd = ["core/*.cpp", "core/*.h"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

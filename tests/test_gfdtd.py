@@ -1,5 +1,5 @@
 """gfdtd: CSXCAD / openEMS compatibility (the API, XML both ways), the operator, the physics on small models with
-known answers (numpy backend; the GPU backend against it when CuPy finds a GPU), and the kicad2ems plugin."""
+known answers (numpy backend; the GPU backend against it when CuPy finds a GPU)."""
 import os
 
 import numpy as np
@@ -9,6 +9,8 @@ from gfdtd import ContinuousStructure, openEMS
 from gfdtd import csx as C
 from gfdtd.engine import gpu_info, core_info
 from gfdtd.operator import build, timestep, Grid
+
+from openems_files import read_fd, read_vtr, steps_taken
 
 # as CSXCAD 0.7 / openEMS 0.37 write it (FDTD.Write2XML), trimmed
 OPENEMS_XML = '''<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
@@ -363,11 +365,9 @@ DUMPS = [('Et', dict(dump_type=0, file_type=0, dump_mode=2), ([-20, -20, 1], [20
 
 
 def test_dumps_in_openems_files(tmp_path):
-    """Time-domain dumps as .vtr frames, frequency-domain ones as openEMS's HDF5, both read by kicad2ems's readers,
+    """Time-domain dumps as .vtr frames, frequency-domain ones as openEMS's HDF5, both read as openEMS's files are read,
     on openEMS's cells (box snapped to lines s0..s1: cells s0-1..s1; flat: the cell below); the frequency-domain
     values are the DFT of the time-domain samples."""
-    from kicad2ems.solvers.openems.fields import read_vtr
-    from kicad2ems.solvers.openems.dumps import read_fd
     import glob
     _, _, path, F = _plate_wave(tmp_path, 50, 'PML_8', dumps=DUMPS)
     frames = sorted(glob.glob(os.path.join(path, 'Et_*.vtr')))
@@ -436,7 +436,6 @@ def test_compressed_operator_gives_the_dense_coefficients(tmp_path):
 
 @pytest.mark.skipif(not core_info()[0], reason='no compiled CPU core (python -m gfdtd.core.build)')
 def test_core_matches_numpy_with_pml_debye_and_dumps(tmp_path):
-    from kicad2ems.solvers.openems.dumps import read_fd
     from gfdtd.engine import resolve_backend, core_threads
     assert resolve_backend('cpu') == 'core' and 1 <= core_threads() <= (os.cpu_count() or 1)
     for bc in ('PML_8', 'MUR'):
@@ -502,13 +501,12 @@ def test_dipole_far_field(tmp_path):
 
 
 def test_probe_files_are_openems_format(tmp_path):
-    from kicad2ems.solvers.openems.simulation import steps_taken
     _, _, res, path = _load_s11(tmp_path, R=50.0)
     names = sorted(os.listdir(path))
     assert {'et', 'port_ut_1', 'port_it_1'} <= set(names)
     head = open(os.path.join(path, 'port_it_1')).read().splitlines()[:4]
     assert head[3].split() == ['%', 't/s', 'current']
-    n = steps_taken(path)                                             # kicad2ems's reader of openEMS's files
+    n = steps_taken(path)                                             # read as openEMS's files are read
     assert n is not None and abs(n - res['steps']) <= 200
 
 
@@ -541,8 +539,6 @@ def test_gpu_matches_numpy_with_pml_debye_and_dumps(tmp_path, monkeypatch, mode)
     """The GPU's three ways of running a step (PML in the H / E kernels, as its own launches, every extension
     apart), and its dump kernel (every field and dump mode), against numpy."""
     import glob
-    from kicad2ems.solvers.openems.dumps import read_fd
-    from kicad2ems.solvers.openems.fields import read_vtr
     monkeypatch.setenv('GFDTD_STEP', mode)
     _, a, pa, _ = _plate_wave(tmp_path, 50, 'PML_8', 'numpy', dumps=DUMPS + NODE_DUMPS, debye=True)
     _, b, pb, F = _plate_wave(tmp_path, 50, 'PML_8', 'cupy', dumps=DUMPS + NODE_DUMPS, debye=True)
@@ -597,47 +593,3 @@ def test_command_line_runs_an_xml(tmp_path, capsys):
     out = capsys.readouterr().out
     assert 'note: RotPoly odd' in out and 'Timestep' in out
     assert os.path.exists(tmp_path / 'run' / 'port_ut_1')
-
-
-# ---- the kicad2ems plugin ----------------------------------------------------------------------------------------
-def test_plugin_registered():
-    from kicad2ems.solvers import registry, get
-    sv = registry()['gfdtd']
-    assert get('gpu-fdtd') is sv and sv.in_auto and not sv.in_all
-    assert sv.check()[0]                                              # numpy at worst
-    assert sv.capabilities['antenna'].startswith('yes')
-    assert [o.key for o in sv.options] == ['gfdtd_backend']
-
-
-def test_engine_api_and_run_dir():
-    from kicad2ems.solvers.openems.simulation import engine_api, run_dir
-    import gfdtd
-    assert engine_api(None) is None and engine_api('openems') is None
-    cs, fd = engine_api('gfdtd:numpy')
-    assert cs is gfdtd.ContinuousStructure and fd().backend == 'numpy'
-
-    class P:
-        name = 'P1+'
-
-    class M:
-        ports = [P()]
-    assert run_dir(M, 0, '/o').endswith(os.path.join('openems', 'exc_P1p'))
-    assert run_dir(M, 0, '/o', 'gfdtd:cupy').endswith(os.path.join('gfdtd', 'exc_P1p'))
-
-
-def test_build_fdtd_builds_the_board_on_gfdtd(demo_files):
-    """kicad2ems's openEMS model, built through gfdtd's API, lowers to an operator: ports, copper, vias."""
-    from kicad2ems.importers.kicad import KiCadBoard
-    from kicad2ems.board import Board
-    from kicad2ems.solvers.openems.boundaries import resolve_bc
-    from kicad2ems.solvers.openems.simulation import build_fdtd, engine_api
-    from kicad2ems.solvers.openems.mesh import auto_mesh
-    base, _ = demo_files
-    m = Board(KiCadBoard(base + '.kicad_pcb'), nets=['RF', 'GND'], pos_file=base + '-top.pos', ground='B.Cu')
-    bc = resolve_bc('auto', m)
-    mesh = auto_mesh(m, 1e9, 8e9, bc=bc, res=10, log=lambda *a: None)
-    FDTD, CSX, ports = build_fdtd(m, mesh, 1e9, 8e9, 0, bc=bc, api=engine_api('gfdtd:numpy'))
-    op = build(CSX, FDTD.settings())
-    assert len(ports) == len(m.ports) == 2 and len(op.exc[0]) > 0
-    assert op.n_pec[2] > 0                                            # the vias' z edges
-    assert len(op.probes) == 4 and op.bc == bc
