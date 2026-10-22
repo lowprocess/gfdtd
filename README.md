@@ -83,7 +83,7 @@ file that both `gfdtd` and `openEMS` can run.
 | Boundaries | PEC, PMC, first-order Mur, PML_n (convolutional PML over the n outermost cells, PEC behind it) |
 | Field dumps | `DumpBox` E, H, J (rot H), Jc (kappa E); time domain (.vtr) and frequency domain (HDF5); at the cell centres (dump mode 2) or the nodes (modes 0, 1); one file per box |
 | Far field | openEMS's NF2FF box (`CreateNF2FFBox`, `CalcNF2FF`), frequency domain, PEC / PMC mirrors: antenna mode |
-| End | field energy (`EndCriteria`), timestep limit, `ABORT` |
+| End | the energy in the field and in the lumped parts (`EndCriteria`), timestep limit, `ABORT` |
 
 Not yet: conductor loss (`--sigma`: conducting sheets run as PEC), Lorentz materials, phased drives in antenna
 mode (`--drive`: the first port alone), time-domain NF2FF, `--converge`, waveguide and MSL ports, and
@@ -162,8 +162,9 @@ The three backends:
 - **numpy**: the dense coefficient arrays as array slices. It is slow, and it is the reference the other two
   are tested against (1e-6).
 
-Probe samples stay on the device and are written out in chunks. The field energy is checked every 100
-timesteps: one host synchronisation each.
+Probe samples stay on the device and are written out in chunks. The energy is checked every 100 timesteps,
+one host synchronisation each: the field's, and the lumped parts' (L I²/2 in an inductor, q²/2C in a series
+capacitor). A filter of lumped parts rings in them, and on the field's energy alone its runs had ended early.
 
 ## Accuracy and speed
 
@@ -195,12 +196,12 @@ gfdtd ran on an AMD RX 7800 XT (ROCm 7, float32), and its CPU core on the i7. Bo
 |---|---|---|---|---|---|
 | rf_coupler (P1 driven) | 0.56 M | 0.006 | 25 s | 3 s | 11 s |
 | rf_diffvia (2 runs, at once on the GPU) | 0.41 M | 0.011 (mode conversion below −45 dB) | 148 s | 11 s | 66 s |
-| demo_lowpass (L, C parts) | 0.18 M | 0.05 (stopband below −35 dB) | 70 s | 1 s | 4 s |
+| demo_lowpass (L, C parts) | 0.18 M | 0.03 | 70 s | 1 s | 4 s |
 | hairpin (high-Q filter) | 0.29 M | 0.02 | 49 s | 6 s | 25 s |
 
 On demo_lowpass, openEMS's field energy stalled above `--end-db`, and the port watch ended its run after
-205,000 timesteps. gfdtd's energy fell to −40 dB after 21,800 timesteps. The CPU core's S-parameters are the
-GPU's within 1e-6.
+205,000 timesteps. gfdtd's energy, the lumped parts' included, fell to −40 dB after 26,900 timesteps. The CPU
+core's S-parameters are the GPU's within 1e-6.
 
 **The engine alone** (`python tools/bench_gfdtd.py`): a microstrip on a Debye substrate, PML (or Mur) on five
 sides, per timestep, in M cell updates per second. "First version" is the dense-coefficient GPU engine with PML:
