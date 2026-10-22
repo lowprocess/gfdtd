@@ -43,7 +43,7 @@ def gpu_info():
 def core_info():
     """(usable, one line): is the compiled CPU core built?"""
     try:
-        from . import _core
+        from . import _core                                         # noqa: F401  (built?)
         n = os.environ.get('OMP_NUM_THREADS') or core_threads()
         return True, f"compiled CPU core, {n} threads"
     except ImportError as e:
@@ -538,7 +538,7 @@ class CupyBackend(_Compressed, NumpyBackend):
 
     def _pml_all(self):
         """The slabs concatenated for the one-launch PML kernels: per field psi, b, c, k1, k2 and the slab table."""
-        cp, xp = self.cp, self.xp
+        cp = self.cp
         self.pml_M = sum(sl['m'] for sl in self.pml)
         if not self.pml:
             return

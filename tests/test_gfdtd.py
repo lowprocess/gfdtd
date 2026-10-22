@@ -170,8 +170,6 @@ def test_operator_metal_edges_and_dielectric_average(tmp_path):
     F = openEMS()
     F.ReadFromXML(str(fn))
     op = build(F.csx, F.settings())
-    nx, ny, nz = op.shape
-    flat = lambda a, i, j, k: ((a * nx + i) * ny + j) * nz + k
     # the cu sheet (x 1..9, y 2..3 at z = 1): the x edge at y = 2 from x = 4 to 5 is PEC, the one at y = 1 is not
     assert op.vi[0, 4, 2, 2] == 0 and op.vi[0, 4, 1, 2] > 0
     # the via at (5, 2.5): no line there, so no z edge inside it; the port's z edges carry the 50 ohm
@@ -299,7 +297,7 @@ def test_debye_material_matches_its_value_at_one_frequency(tmp_path):
     """A capacitor filled with a Debye material and one filled with a plain material of the same complex
     permittivity at 0.3 GHz: the same impedance there, and not at 0.1 GHz."""
     e_inf, d_eps, tau, kap = 2.0, 3.0, 0.5e-9, 1e-3
-    f, w = 0.3e9, 2 * np.pi * 0.3e9
+    w = 2 * np.pi * 0.3e9
     er = e_inf + d_eps / (1 + 1j * w * tau)
 
     def debye(csx):
@@ -425,7 +423,6 @@ def test_compressed_operator_gives_the_dense_coefficients(tmp_path):
     c = compress(op)
     assert c.code.dtype == np.uint8 and c.code.shape == op.shape and c.ncode < 100 and c.P == 1 and c.nslot > 0
     np.testing.assert_allclose(np.moveaxis(c.vv[c.code], -1, 0), op.vv, atol=2e-6)
-    g = op.grid
     G = [c.G[i * sum(op.shape):(i + 1) * sum(op.shape)] for i in range(4)]
     ax = lambda arr, a: np.split(arr, np.cumsum(op.shape)[:2])[a]
     r = lambda v, a: v.reshape([-1 if x == a else 1 for x in range(3)])
