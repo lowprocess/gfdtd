@@ -40,7 +40,7 @@ version = {attr = "gfdtd.__version__"}
 include = ["gfdtd*"]
 
 [tool.setuptools.package-data]
-gfdtd = ["core/*.cpp", "core/*.h"]
+gfdtd = ["core/*.cpp", "core/*.h", "*.so", "*.pyd"]     # the update code (GPU kernels and CPU core), the built core
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
