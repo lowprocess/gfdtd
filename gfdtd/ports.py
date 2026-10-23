@@ -39,16 +39,15 @@ def _load_ui_file(path):
 
 
 def dft_time2freq(t, val, freq, signal_type='pulse'):
-    """openEMS's DFT_time2freq: the single-sided spectrum of val(t) at freq."""
-    freq = np.atleast_1d(np.asarray(freq, float))
-    f_val = np.exp(-2j * np.pi * np.outer(freq, t)) @ val
-    if signal_type == 'pulse':
-        f_val *= t[1] - t[0]
-    elif signal_type == 'periodic':
-        f_val /= len(t)
-    else:
+    """openEMS's DFT_time2freq: the single-sided spectrum of val(t) at freq, 2 dt sum(val exp(-j w t)) for a pulse
+    (2 / N sum for a periodic signal); in blocks of 64 frequencies, (64, nt) at a time."""
+    if signal_type not in ('pulse', 'periodic'):
         raise ValueError(f'unknown signal type "{signal_type}"')
-    return 2 * f_val
+    freq = np.atleast_1d(np.asarray(freq, float))
+    f_val = np.empty(len(freq), complex)
+    for i in range(0, len(freq), 64):
+        f_val[i:i + 64] = np.exp(-2j * np.pi * np.outer(freq[i:i + 64], t)) @ val
+    return 2 * f_val * ((t[1] - t[0]) if signal_type == 'pulse' else 1 / len(t))
 
 
 class UI_data:
@@ -73,8 +72,8 @@ class Port:
         self.CSX, self.number, self.excite = CSX, port_nr, excite
         self.start, self.stop = np.array(start, float), np.array(stop, float)
         self.Z_ref = None
-        self.U_filenames = kw.get('U_filenames', [])
-        self.I_filenames = kw.get('I_filenames', [])
+        self.U_filenames = list(kw.get('U_filenames', []))
+        self.I_filenames = list(kw.get('I_filenames', []))
         self.port_props = []
         self.priority = kw.get('priority', 0)
         self.prefix = kw.get('PortNamePrefix', '')
@@ -82,12 +81,23 @@ class Port:
         self.measplane_shift = 0
         self.lbl_temp = self.prefix + 'port_{}' + '_{}'.format(self.number)
 
-    def _AddProbe(self, CSX, name, **kw):
-        for prop in CSX.GetPropertiesByName(name):
-            if isinstance(prop, C.ProbeBox) and not isinstance(prop, C.DumpBox):
-                raise ValueError(f'port {self.number}: a probe named "{name}" already exists, port numbers must be '
-                                 'unique (or use a different PortNamePrefix)')
-        return CSX.AddProbe(name, **kw)
+    def _probe(self, kind, sfx, p0, p1, priority=0, **kw):
+        """Probe <kind> ('ut' or 'it') <sfx> of this port on the box p0 -> p1, listed in U_ / I_filenames."""
+        name = self.lbl_temp.format(kind) + sfx
+        if any(isinstance(prop, C.ProbeBox) for prop in self.CSX.GetPropertiesByName(name)):
+            raise ValueError(f'port {self.number}: a probe named "{name}" already exists, port numbers must be '
+                             'unique (or use a different PortNamePrefix)')
+        pr = self.CSX.AddProbe(name, **kw)
+        pr.AddBox(p0, p1, priority=priority)
+        self.port_props.append(pr)
+        (self.U_filenames if kind == 'ut' else self.I_filenames).append(name)
+        return pr
+
+    def _excitation(self, lbl, vec, exc_type=0):
+        """This port's excitation <lbl> (for the caller to give its primitive)."""
+        exc = self.CSX.AddExcitation(self.lbl_temp.format(lbl), exc_type=exc_type, exc_val=vec, delay=self.delay)
+        self.port_props.append(exc)
+        return exc
 
     def SetEnabled(self, val):
         """Enable or disable this port's excitation (a port made with excite=0 has none to enable)."""
@@ -133,7 +143,7 @@ class Port:
         self.if_inc = 0.5 * (self.if_tot + self.uf_tot / self.Z_ref)
         self.uf_ref = self.uf_tot - self.uf_inc
         self.if_ref = self.if_inc - self.if_tot
-        if type(self.Z_ref) in (int, float):
+        if np.isscalar(self.Z_ref):
             self.ut_inc = 0.5 * (self.ut_tot + self.it_tot * self.Z_ref)
             self.it_inc = 0.5 * (self.it_tot + self.ut_tot / self.Z_ref)
             self.ut_ref = self.ut_tot - self.ut_inc
@@ -143,40 +153,46 @@ class Port:
         self.P_acc = 0.5 * np.real(self.uf_tot * np.conj(self.if_tot))
 
 
-def _three_lines(mesh, prop_ny, pos, direction):
-    """The three propagation lines round the measurement plane at pos (reversed for a port pointing down)."""
-    lines = mesh.GetLines(prop_ny)
-    idx = int(np.argmin(np.abs(lines - pos)))
-    idx = max(1, min(idx, len(lines) - 2))
-    ml = lines[idx - 1:idx + 2]
-    return ml[::-1] if direction < 0 else ml
-
-
 class _TLPort(Port):
-    """The transmission-line ports' post-processing: Z and beta from the probes at three planes (openEMS's)."""
-    def _tl(self, uf_A, uf_B, uf_C, ut_B):
-        self.uf_tot, self.ut_tot = uf_B, ut_B
-        self.i_data = UI_data(self.I_filenames, self._path, self._freq, self._signal)
-        self.if_tot = 0.5 * (self.i_data.ui_f_val[0] + self.i_data.ui_f_val[1])
-        self.it_tot = 0.5 * (self.i_data.ui_val[0] + self.i_data.ui_val[1])
-        self.i_time = self.i_data.ui_time[0]
-        unit = self.CSX.GetGrid().GetDeltaUnit()
-        Et = uf_B
-        dEt = (uf_C - uf_A) / (np.sum(np.abs(self.U_delta)) * unit)
-        Ht = self.if_tot
-        dHt = (self.i_data.ui_f_val[1] - self.i_data.ui_f_val[0]) / (np.abs(self.I_delta[0]) * unit)
-        beta = np.sqrt(-dEt * dHt / (Ht * Et))
-        beta[np.real(beta) < 0] *= -1
-        self.beta = beta
-        self.Z_ref = np.sqrt(Et * dEt / (Ht * dHt))
+    """The transmission-line ports: voltage probes at three planes along the line, current probes between them; Z and
+    beta from their differences (openEMS's)."""
+    def _planes(self, kw):
+        """The three mesh lines round the measurement plane (the port's middle, or MeasPlaneShift from start), in the
+        port's direction; sets measplane_shift, U_delta and I_delta."""
+        p = self.prop_ny
+        pos = self.start[p] + self.direction * kw['MeasPlaneShift'] if 'MeasPlaneShift' in kw else \
+            0.5 * (self.start[p] + self.stop[p])
+        lines = self.CSX.GetGrid().GetLines(p)
+        i = max(1, min(int(np.argmin(np.abs(lines - pos))), len(lines) - 2))
+        ml = lines[i - 1:i + 2][::-1 if self.direction < 0 else 1]
+        self.measplane_shift = abs(ml[1] - self.start[p])
+        self.U_delta = np.diff(ml)
+        self.I_delta = np.diff(ml[:2] + self.U_delta / 2)
+        return ml
+
+    def _feed(self, kw):
+        """The mesh line nearest the feed, FeedShift from start."""
+        lines = self.CSX.GetGrid().GetLines(self.prop_ny)
+        return lines[int(np.argmin(np.abs(lines - (self.start[self.prop_ny] + kw.get('FeedShift', 0) * self.direction))))]
 
     def ReadUIData(self, sim_path, freq, signal_type='pulse'):
-        self._path, self._freq, self._signal = sim_path, freq, signal_type
-        self.u_data = u = UI_data(self.U_filenames, sim_path, freq, signal_type)
-        self.u_time = u.ui_time[0]
-        k = len(u.fns) // 3                                         # probes per plane: 1 (MSL, coax) or 2
-        f = [sum(u.ui_f_val[n * k:(n + 1) * k]) for n in range(3)]
-        self._tl(f[0], f[1], f[2], sum(u.ui_val[k:2 * k]))
+        """The voltage at the middle plane (probes per plane: 1 (MSL, coax) or 2, summed), the current between the
+        planes; Z and beta from the differences."""
+        u = self.u_data = UI_data(self.U_filenames, sim_path, freq, signal_type)
+        i = self.i_data = UI_data(self.I_filenames, sim_path, freq, signal_type)
+        k = len(u.fns) // 3
+        uf_A, uf_B, uf_C = (sum(u.ui_f_val[n * k:(n + 1) * k]) for n in range(3))
+        self.u_time, self.i_time = u.ui_time[0], i.ui_time[0]
+        self.uf_tot, self.ut_tot = uf_B, sum(u.ui_val[k:2 * k])
+        self.if_tot = 0.5 * (i.ui_f_val[0] + i.ui_f_val[1])
+        self.it_tot = 0.5 * (i.ui_val[0] + i.ui_val[1])
+        unit = self.CSX.GetGrid().GetDeltaUnit()
+        dEt = (uf_C - uf_A) / (np.sum(np.abs(self.U_delta)) * unit)
+        dHt = (i.ui_f_val[1] - i.ui_f_val[0]) / (np.abs(self.I_delta[0]) * unit)
+        beta = np.sqrt(-dEt * dHt / (self.if_tot * uf_B))
+        beta[np.real(beta) < 0] *= -1
+        self.beta = beta
+        self.Z_ref = np.sqrt(uf_B * dEt / (self.if_tot * dHt))
 
 
 class MSLPort(_TLPort):
@@ -184,76 +200,46 @@ class MSLPort(_TLPort):
     ground), propagating along prop_dir. FeedShift, MeasPlaneShift, Feed_R as openEMS's."""
     def __init__(self, CSX, port_nr, metal_prop, start, stop, prop_dir, exc_dir, excite=0, **kw):
         super().__init__(CSX, port_nr=port_nr, start=start, stop=stop, excite=excite, **kw)
-        self.exc_ny, self.prop_ny = C.ny_dir(exc_dir), C.ny_dir(prop_dir)
-        self.direction = np.sign(self.stop[self.prop_ny] - self.start[self.prop_ny])
-        self.upside_down = np.sign(self.stop[self.exc_ny] - self.start[self.exc_ny])
-        if not (self.start != self.stop).all():
+        start, stop = self.start, self.stop
+        x, p = self.exc_ny, self.prop_ny = C.ny_dir(exc_dir), C.ny_dir(prop_dir)
+        self.direction = np.sign(stop[p] - start[p])
+        self.upside_down = np.sign(stop[x] - start[x])
+        if not (start != stop).all():
             raise Exception('Start coordinate must not be equal to stop coordinate')
-        if self.exc_ny == self.prop_ny:
+        if x == p:
             raise Exception('Excitation direction must not be equal to propagation direction')
-        self.feed_shift = kw.get('FeedShift', 0)
-        self.measplane_shift = kw.get('MeasPlaneShift', 0.5 * abs(self.start[self.prop_ny] - self.stop[self.prop_ny]))
-        self.measplane_pos = self.start[self.prop_ny] + self.measplane_shift * self.direction
-        self.feed_R = kw.get('Feed_R', np.inf)
-        ms0, ms1 = self.start.copy(), self.stop.copy()
-        ms1[self.exc_ny] = ms0[self.exc_ny]
-        metal_prop.AddBox(ms0, ms1, priority=self.priority)
-        lines = CSX.GetGrid().GetLines(self.prop_ny)
-        if not len(lines) > 5:
+        if len(CSX.GetGrid().GetLines(p)) <= 5:
             raise Exception('At least 5 lines in propagation direction required!')
-        mi = int(np.argmin(np.abs(lines - self.measplane_pos)))
-        mi = min(max(mi, 1), len(lines) - 2)
-        self.measplane_shift = abs(self.start[self.prop_ny] - lines[mi])
-        pi = np.array([mi - 1, mi, mi + 1])
-        if self.direction < 0:
-            pi = pi[::-1]
-        upos = lines[pi]
-        self.U_filenames, self.U_delta = [], np.diff(upos)
+        self.feed_R = kw.get('Feed_R', np.inf)
+        ms0, ms1 = start.copy(), stop.copy()
+        ms1[x] = ms0[x]
+        metal_prop.AddBox(ms0, ms1, priority=self.priority)
+        upos = self._planes(kw)
         for n, sfx in enumerate('ABC'):
-            u0, u1 = 0.5 * (self.start + self.stop), 0.5 * (self.start + self.stop)
-            u0[self.prop_ny] = u1[self.prop_ny] = upos[n]
-            u0[self.exc_ny], u1[self.exc_ny] = self.start[self.exc_ny], self.stop[self.exc_ny]
-            name = self.lbl_temp.format('ut') + sfx
-            self.U_filenames.append(name)
-            pr = self._AddProbe(CSX, name, p_type=0)
-            pr.AddBox(u0, u1)
-            self.port_props.append(pr)
-        ipos = upos[0:2] + np.diff(upos) / 2.0
-        self.I_filenames, self.I_delta = [], np.diff(ipos)
-        i0, i1 = self.start.copy(), self.stop.copy()
-        i1[self.exc_ny] = self.start[self.exc_ny]
+            u0, u1 = 0.5 * (start + stop), 0.5 * (start + stop)
+            u0[p] = u1[p] = upos[n]
+            u0[x], u1[x] = start[x], stop[x]
+            self._probe('ut', sfx, u0, u1, p_type=0)
+        i0, i1 = start.copy(), stop.copy()
+        i1[x] = start[x]
         for n, sfx in enumerate('AB'):
-            i0[self.prop_ny] = i1[self.prop_ny] = ipos[n]
-            name = self.lbl_temp.format('it') + sfx
-            self.I_filenames.append(name)
-            pr = self._AddProbe(CSX, name, p_type=1, weight=self.direction, norm_dir=self.prop_ny)
-            pr.AddBox(i0, i1)
-            self.port_props.append(pr)
+            i0[p] = i1[p] = upos[n] + self.U_delta[n] / 2
+            self._probe('it', sfx, i0, i1, p_type=1, weight=self.direction, norm_dir=p)
         if excite != 0:
-            ei = int(np.argmin(np.abs(lines - (self.start[self.prop_ny] + self.feed_shift * self.direction))))
-            e0, e1 = self.start.copy(), self.stop.copy()
-            e0[self.prop_ny] = e1[self.prop_ny] = lines[ei]
+            e0, e1 = start.copy(), stop.copy()
+            e0[p] = e1[p] = self._feed(kw)
             vec = np.zeros(3)
-            vec[self.exc_ny] = -1 * self.upside_down * excite
-            exc = CSX.AddExcitation(self.lbl_temp.format('excite'), exc_type=0, exc_val=vec, delay=self.delay)
-            exc.AddBox(e0, e1, priority=self.priority)
-            self.port_props.append(exc)
+            vec[x] = -1 * self.upside_down * excite
+            self._excitation('excite', vec).AddBox(e0, e1, priority=self.priority)
         if self.feed_R >= 0 and not np.isinf(self.feed_R):
-            r0, r1 = self.start.copy(), self.stop.copy()
-            r1[self.prop_ny] = r0[self.prop_ny]
+            r0, r1 = start.copy(), stop.copy()
+            r1[p] = r0[p]
             if self.feed_R == 0:
                 metal_prop.AddBox(r0, r1)
             else:
-                el = CSX.AddLumpedElement(self.lbl_temp.format('resist'), ny=self.exc_ny, caps=True, R=self.feed_R)
+                el = CSX.AddLumpedElement(self.lbl_temp.format('resist'), ny=x, caps=True, R=self.feed_R)
                 el.AddBox(r0, r1)
                 self.port_props.append(el)
-
-    def ReadUIData(self, sim_path, freq, signal_type='pulse'):
-        """The voltage of the middle probe, the current between the planes; Z and beta from the differences."""
-        self._path, self._freq, self._signal = sim_path, freq, signal_type
-        self.u_data = u = UI_data(self.U_filenames, sim_path, freq, signal_type)
-        self.u_time = u.ui_time[0]
-        self._tl(u.ui_f_val[0], u.ui_f_val[1], u.ui_f_val[2], u.ui_val[1])
 
 
 class WaveguidePort(Port):
@@ -281,21 +267,18 @@ class WaveguidePort(Port):
             local_origin = np.array(local_origin, float)
         use_func = self.E_func is not None and self.H_func is not None
         if excite != 0:
+            if excite_type not in (0, 1, 2, 3):
+                raise Exception('Unsupported excitation type. Only 0 or 2 for WaveguidePort')
             e0, e1 = np.array(start, float), np.array(stop, float)
             e1[self.exc_ny] = e0[self.exc_ny]
             vec = excite * np.ones(3)
             vec[self.exc_ny] = 0
-            exc = CSX.AddExcitation(self.lbl_temp.format('excite'), exc_type=excite_type, exc_val=vec,
-                                    delay=self.delay)
-            if excite_type not in (0, 1, 2, 3):
-                raise Exception('Unsupported excitation type. Only 0 or 2 for WaveguidePort')
+            exc = self._excitation('excite', vec, excite_type)
             if not use_func:
                 if not (isinstance(self.E_file, str) and isinstance(self.H_file, str)):
                     raise Exception('Both E_WG_file and H_WG_file must be strings (HDF5 file paths)')
                 exc.SetWeightFile(self.E_file if excite_type in (0, 1) else self.H_file)
-                d = [0, 0, 0]
-                d[self.exc_ny] = 1
-                exc.SetPropagationDir(d)
+                exc.SetPropagationDir(np.eye(3)[self.exc_ny])
             else:
                 if not isinstance(self.E_func, list):
                     raise Exception('Unsupported input type for "E_WG_func" or "H_WG_func". Expected a list of strings')
@@ -303,22 +286,17 @@ class WaveguidePort(Port):
             if local_origin is not None:
                 exc.SetWeightOrigin(local_origin)
             exc.AddBox(e0, e1, priority=self.priority)
-            self.port_props.append(exc)
         m0, m1 = np.array(start, float), np.array(stop, float)
         m0[self.exc_ny] = m1[self.exc_ny]
         self.measplane_shift = abs(stop[self.exc_ny] - start[self.exc_ny])
-        for kind, ptype, func, fn, w in (('ut', 10, self.E_func, self.E_file, 1), ('it', 11, self.H_func, self.H_file,
-                                                                                 self.direction)):
-            name = self.lbl_temp.format(kind)
-            kwp = {'mode_function': [str(x) for x in func]} if use_func else {}
-            pr = self._AddProbe(CSX, name, p_type=ptype, weight=w, **kwp)
+        for kind, ptype, func, fn, w in (('ut', 10, self.E_func, self.E_file, 1),
+                                         ('it', 11, self.H_func, self.H_file, self.direction)):
+            pr = self._probe(kind, '', m0, m1, p_type=ptype, weight=w,
+                             **({'mode_function': [str(x) for x in func]} if use_func else {}))
             if not use_func:
                 pr.SetModeFile(fn)
             if local_origin is not None:
                 pr.SetModeOrigin(local_origin)
-            pr.AddBox(m0, m1)
-            self.port_props.append(pr)
-            (self.U_filenames if kind == 'ut' else self.I_filenames).append(name)
 
     def CalcPort(self, sim_path, freq, ref_impedance=None, ref_plane_shift=None, signal_type='pulse', ZL=-1):
         """beta and the wave impedance ZL from the cutoff (or ZL given), the S-parameters on ZL unless
@@ -344,15 +322,13 @@ class RectWGPort(WaveguidePort):
             raise Exception(f'Currently only TE-modes are supported! Mode found: {mode_name}')
         self.TE, self.TM = True, False
         unit = CSX.GetGrid().GetDeltaUnit()
-        M, N = float(mode_name[2]), float(mode_name[3])
-        self.M, self.N = M, N
+        M, N = self.M, self.N = float(mode_name[2]), float(mode_name[3])
         kc = np.sqrt((M * np.pi / a) ** 2 + (N * np.pi / b) ** 2)
         a, b = a / unit, b / unit
         nP, nPP = 'xyz'[ny_P], 'xyz'[ny_PP]
         E, H = [0, 0, 0], [0, 0, 0]
         if N > 0:
-            E[ny_P] = f'{N / b}*cos({M * np.pi / a}*{nP})*sin({N * np.pi / b}*{nPP})'
-            H[ny_PP] = f'{N / b}*cos({M * np.pi / a}*{nP})*sin({N * np.pi / b}*{nPP})'
+            E[ny_P] = H[ny_PP] = f'{N / b}*cos({M * np.pi / a}*{nP})*sin({N * np.pi / b}*{nPP})'
         if M > 0:
             E[ny_PP] = f'{-1 * M / a}*sin({M * np.pi / a}*{nP})*cos({N * np.pi / b}*{nPP})'
             H[ny_P] = f'{M / a}*sin({M * np.pi / a}*{nP})*cos({N * np.pi / b}*{nPP})'
@@ -370,8 +346,7 @@ class CircWGPort(WaveguidePort):
                  local_origin='center', **kw):
         if not mode_name.upper().startswith('TE'):
             raise Exception('CircWGPort: only TE modes are supported')
-        n, m = int(mode_name[2]), int(mode_name[3])
-        pnm = self._pnm.get((n, m))
+        pnm = self._pnm.get((int(mode_name[2]), int(mode_name[3])))
         if pnm is None:
             raise Exception(f'CircWGPort: unsupported TE_nm mode: {mode_name}')
         unit = CSX.GetGrid().GetDeltaUnit()
@@ -382,17 +357,15 @@ class CircWGPort(WaveguidePort):
         u, v = 'xyz'[ny_P], 'xyz'[ny_PP]
         rho, ang = f'sqrt({u}*{u}+{v}*{v})', f'(atan2({v},{u}))-{pol_ang:.15g}'
         c_r, c_a = -1.0 / kd ** 2, 1.0 / kd
-        Er = f'{c_r:.15g}/({rho})*cos({ang})*j1({kd:.15g}*({rho}))'
+        Er = Ha = f'{c_r:.15g}/({rho})*cos({ang})*j1({kd:.15g}*({rho}))'
         Ea = f'{c_a:.15g}*sin({ang})*0.5*(j0({kd:.15g}*({rho}))-jn(2,{kd:.15g}*({rho})))'
         Hr = f'{-c_a:.15g}*sin({ang})*0.5*(j0({kd:.15g}*({rho}))-jn(2,{kd:.15g}*({rho})))'
-        Ha = f'{c_r:.15g}/({rho})*cos({ang})*j1({kd:.15g}*({rho}))'
         mask = f'(({rho})<{radius / unit:.15g})'
         ca, sa = f'{u}/({rho})', f'{v}/({rho})'
         E, H = ['0', '0', '0'], ['0', '0', '0']
-        E[ny_P] = f'(({Er})*({ca})-({Ea})*({sa}))*{mask}'
-        E[ny_PP] = f'(({Er})*({sa})+({Ea})*({ca}))*{mask}'
-        H[ny_P] = f'(({Hr})*({ca})-({Ha})*({sa}))*{mask}'
-        H[ny_PP] = f'(({Hr})*({sa})+({Ha})*({ca}))*{mask}'
+        for F, R, A in ((E, Er, Ea), (H, Hr, Ha)):
+            F[ny_P] = f'(({R})*({ca})-({A})*({sa}))*{mask}'
+            F[ny_PP] = f'(({R})*({sa})+({A})*({ca}))*{mask}'
         super().__init__(CSX, port_nr=port_nr, start=start, stop=stop, exc_dir=exc_dir, E_WG_func=E, H_WG_func=H,
                          kc=kc, excite=excite, local_origin=local_origin, **kw)
 
@@ -404,85 +377,53 @@ class CoaxialPort(_TLPort):
     def __init__(self, CSX, port_nr, pec_prop, mat_prop, start, stop, prop_dir, r_i, r_o, r_os, excite=0, **kw):
         super().__init__(CSX, port_nr=port_nr, start=start, stop=stop, excite=excite, **kw)
         start, stop = self.start, self.stop
-        self.prop_ny = C.ny_dir(prop_dir)
-        self.ny_P, self.ny_PP = (self.prop_ny + 1) % 3, (self.prop_ny + 2) % 3
-        self.direction = np.sign(stop[self.prop_ny] - start[self.prop_ny])
+        p = self.prop_ny = C.ny_dir(prop_dir)
+        P, PP = self.ny_P, self.ny_PP = (p + 1) % 3, (p + 2) % 3
+        self.direction = np.sign(stop[p] - start[p])
         if self.direction == 0:
             raise Exception('CoaxialPort: start and stop must differ in propagation direction')
         self.r_i, self.r_o = r_i, r_o
-        feed_shift, feed_R = kw.get('FeedShift', 0), kw.get('Feed_R', np.inf)
-        mpos = 0.5 * (start[self.prop_ny] + stop[self.prop_ny])
-        if 'MeasPlaneShift' in kw:
-            mpos = start[self.prop_ny] + self.direction * kw['MeasPlaneShift']
+        feed_R = kw.get('Feed_R', np.inf)
         pec_prop.AddCylinder(start, stop, r_i, priority=self.priority)
         pec_prop.AddCylindricalShell(start, stop, 0.5 * (r_o + r_os), r_os - r_o, priority=self.priority)
         if mat_prop is not None:
             mat_prop.AddCylindricalShell(start, stop, 0.5 * (r_i + r_o), r_o - r_i, priority=self.priority - 1)
         self.port_props.append(pec_prop)
-        mesh = CSX.GetGrid()
-        ml = _three_lines(mesh, self.prop_ny, mpos, self.direction)
-        self.measplane_shift = abs(ml[1] - start[self.prop_ny])
-        self.U_delta = np.diff(ml)
-        ipos = ml[:2] + np.diff(ml) / 2.0
-        self.I_delta = np.diff(ipos)
-        self.U_filenames = []
+        ml = self._planes(kw)
         for n, sfx in enumerate('ABC'):
             v0 = start.copy()
-            v0[self.prop_ny] = ml[n]
-            v0[self.ny_P] = start[self.ny_P] + r_i
+            v0[p] = ml[n]
+            v0[P] = start[P] + r_i
             v1 = v0.copy()
-            v1[self.ny_P] = start[self.ny_P] + r_o
-            name = self.lbl_temp.format('ut') + sfx
-            self.U_filenames.append(name)
-            pr = self._AddProbe(CSX, name, p_type=0, weight=1)
-            pr.AddBox(v0, v1)
-            self.port_props.append(pr)
+            v1[P] = start[P] + r_o
+            self._probe('ut', sfx, v0, v1, p_type=0, weight=1)
         margin = 0.1 * (r_o - r_i)
-        self.I_filenames = []
         for n, sfx in enumerate('AB'):
-            i0 = np.zeros(3)
-            i0[self.prop_ny] = 0.5 * (ml[n] + ml[n + 1])
-            i0[self.ny_P] = start[self.ny_P] - r_i - margin
-            i0[self.ny_PP] = start[self.ny_PP] - r_i - margin
-            i1 = i0.copy()
-            i1[self.ny_P] = start[self.ny_P] + r_i + margin
-            i1[self.ny_PP] = start[self.ny_PP] + r_i + margin
-            name = self.lbl_temp.format('it') + sfx
-            self.I_filenames.append(name)
-            pr = self._AddProbe(CSX, name, p_type=1, weight=self.direction, norm_dir=self.prop_ny)
-            pr.AddBox(i0, i1)
-            self.port_props.append(pr)
+            i0, i1 = start - (r_i + margin), start + (r_i + margin)
+            i0[p] = i1[p] = 0.5 * (ml[n] + ml[n + 1])
+            self._probe('it', sfx, i0, i1, p_type=1, weight=self.direction, norm_dir=p)
         if excite != 0:
-            lines = mesh.GetLines(self.prop_ny)
-            fi = int(np.argmin(np.abs(lines - (start[self.prop_ny] + feed_shift * self.direction))))
-            mc = np.min(np.diff(lines))
-            x0 = start.copy()
-            x0[self.prop_ny] = lines[fi] - 0.01 * mc
-            x1 = x0.copy()
-            x1[self.prop_ny] = lines[fi] + 0.01 * mc
-            cx, cy = start[self.ny_P], start[self.ny_PP]
-            dX, dY = f"({'xyz'[self.ny_P]}-{cx:.15g})", f"({'xyz'[self.ny_PP]}-{cy:.15g})"
+            feed, mc = self._feed(kw), np.min(np.diff(CSX.GetGrid().GetLines(p)))
+            x0, x1 = start.copy(), start.copy()
+            x0[p], x1[p] = feed - 0.01 * mc, feed + 0.01 * mc
+            dX, dY = f"({'xyz'[P]}-{start[P]:.15g})", f"({'xyz'[PP]}-{start[PP]:.15g})"
             r2 = f'({dX}*{dX}+{dY}*{dY})'
             mask = f'*(sqrt({r2})<{r_o:.15g})*(sqrt({r2})>{r_i:.15g})'
             fE = ['0', '0', '0']
-            fE[self.ny_P], fE[self.ny_PP] = f'{dX}/{r2}{mask}', f'{dY}/{r2}{mask}'
+            fE[P], fE[PP] = f'{dX}/{r2}{mask}', f'{dY}/{r2}{mask}'
             vec = excite * np.ones(3)
-            vec[self.prop_ny] = 0
-            exc = CSX.AddExcitation(self.lbl_temp.format('excite'), exc_type=0, exc_val=vec, delay=self.delay)
+            vec[p] = 0
+            exc = self._excitation('excite', vec)
             exc.SetWeightFunction(fE)
             exc.AddCylindricalShell(x0, x1, 0.5 * (r_i + r_o), r_o - r_i, priority=0)
-            self.port_props.append(exc)
         t0, t1 = start.copy(), stop.copy()
-        t1[self.prop_ny] = t0[self.prop_ny]
+        t1[p] = t0[p]
         if feed_R == 0:
             pec_prop.AddBox(t0, t1, priority=self.priority)
             pec_prop.AddCylindricalShell(t0, t1, 0.5 * (r_i + r_o), r_o - r_i, priority=self.priority)
-        elif np.isinf(feed_R):
-            pass
-        elif feed_R > 0:
-            raise NotImplementedError('CoaxialPort: finite Feed_R > 0 is not yet supported; use Feed_R=0 or Feed_R=inf')
-        else:
-            raise Exception('CoaxialPort: Feed_R <= 0 is not allowed')
+        elif not np.isinf(feed_R):
+            raise NotImplementedError('CoaxialPort: finite Feed_R > 0 is not yet supported; use Feed_R=0 or '
+                                      'Feed_R=inf') if feed_R > 0 else Exception('CoaxialPort: Feed_R <= 0 is not allowed')
 
 
 class StripLinePort(_TLPort):
@@ -491,59 +432,39 @@ class StripLinePort(_TLPort):
     def __init__(self, CSX, port_nr, metal_prop, start, stop, prop_dir, exc_dir, height, excite=0, **kw):
         super().__init__(CSX, port_nr=port_nr, start=start, stop=stop, excite=excite, **kw)
         start, stop = self.start, self.stop
-        self.prop_ny = C.ny_dir(prop_dir)
-        self.height_ny = C.ny_dir(exc_dir)
-        self.width_ny = 3 - self.prop_ny - self.height_ny
-        if start[self.height_ny] != stop[self.height_ny]:
+        p, h = self.prop_ny, self.height_ny = C.ny_dir(prop_dir), C.ny_dir(exc_dir)
+        w = self.width_ny = 3 - p - h
+        if start[h] != stop[h]:
             raise Exception('StripLinePort: start/stop in height direction must be equal')
-        self.direction = np.sign(stop[self.prop_ny] - start[self.prop_ny])
+        self.direction = np.sign(stop[p] - start[p])
         if self.direction == 0:
             raise Exception('StripLinePort: start/stop in prop direction must differ')
-        feed_shift, feed_R = kw.get('FeedShift', 0), kw.get('Feed_R', np.inf)
+        feed_R = kw.get('Feed_R', np.inf)
         ns, ne = np.minimum(start, stop), np.maximum(start, stop)
         metal_prop.AddBox(start, stop, priority=self.priority)
         self.port_props.append(metal_prop)
-        mpos = 0.5 * (ns[self.prop_ny] + ne[self.prop_ny])
-        if 'MeasPlaneShift' in kw:
-            mpos = start[self.prop_ny] + self.direction * kw['MeasPlaneShift']
-        mesh = CSX.GetGrid()
-        ml = _three_lines(mesh, self.prop_ny, mpos, self.direction)
-        self.measplane_shift = abs(ml[1] - start[self.prop_ny])
-        self.U_delta = np.diff(ml)
-        ipos = ml[:2] + np.diff(ml) / 2.0
-        self.I_delta = np.diff(ipos)
-        wl = mesh.GetLines(self.width_ny)
-        wc = wl[int(np.argmin(np.abs(wl - 0.5 * (ns[self.width_ny] + ne[self.width_ny]))))]
+        ml = self._planes(kw)
+        wl = CSX.GetGrid().GetLines(w)
+        wc = wl[int(np.argmin(np.abs(wl - 0.5 * (ns[w] + ne[w]))))]
         hv = np.zeros(3)
-        hv[self.height_ny] = height
-        self.U_filenames = []
-        for n, pair in enumerate((('A1', 'A2'), ('B1', 'B2'), ('C1', 'C2'))):
+        hv[h] = height
+        for n, plane in enumerate('ABC'):
             pt = np.zeros(3)
-            pt[self.prop_ny], pt[self.width_ny], pt[self.height_ny] = ml[n], wc, start[self.height_ny]
-            for sfx, sgn in zip(pair, (1, -1)):
-                name = self.lbl_temp.format('ut') + sfx
-                self.U_filenames.append(name)
-                pr = self._AddProbe(CSX, name, p_type=0, weight=0.5)
-                pr.AddBox(pt, pt + sgn * hv, priority=self.priority)
-                self.port_props.append(pr)
-        self._current_probes(mesh, start, ns, ne, ml)
+            pt[p], pt[w], pt[h] = ml[n], wc, start[h]
+            for k, sgn in ((1, 1), (2, -1)):
+                self._probe('ut', f'{plane}{k}', pt, pt + sgn * hv, priority=self.priority, p_type=0, weight=0.5)
+        self._current_probes(start, ns, ne, ml)
         if excite != 0:
-            lines = mesh.GetLines(self.prop_ny)
-            fi = int(np.argmin(np.abs(lines - (start[self.prop_ny] + feed_shift * self.direction))))
-            x0 = np.zeros(3)
-            x0[self.prop_ny], x0[self.width_ny], x0[self.height_ny] = lines[fi], ns[self.width_ny], ns[self.height_ny]
-            x1 = x0.copy()
-            x1[self.width_ny], x1[self.height_ny] = ne[self.width_ny], ne[self.height_ny]
+            x0, x1 = ns.copy(), ne.copy()
+            x0[p] = x1[p] = self._feed(kw)
             ev = np.zeros(3)
-            ev[self.height_ny] = excite
-            for lbl, sgn in (('excite_1', 1), ('excite_2', -1)):
-                exc = CSX.AddExcitation(self.lbl_temp.format(lbl), exc_type=0, exc_val=sgn * ev, delay=self.delay)
-                exc.AddBox(x0, x1 + sgn * hv, priority=self.priority)
-                self.port_props.append(exc)
+            ev[h] = excite
+            for k, sgn in ((1, 1), (2, -1)):
+                self._excitation(f'excite_{k}', sgn * ev).AddBox(x0, x1 + sgn * hv, priority=self.priority)
         r0, r1 = start.copy(), stop.copy()
-        r1[self.prop_ny] = r0[self.prop_ny]
+        r1[p] = r0[p]
         if feed_R > 0 and not np.isinf(feed_R):
-            el = CSX.AddLumpedElement(self.lbl_temp.format('resist'), ny=self.height_ny, R=2 * feed_R)
+            el = CSX.AddLumpedElement(self.lbl_temp.format('resist'), ny=h, R=2 * feed_R)
             el.AddBox(r0, r1 + hv, priority=self.priority)
             el.AddBox(r0, r1 - hv, priority=self.priority)
             self.port_props.append(el)
@@ -553,27 +474,19 @@ class StripLinePort(_TLPort):
         elif feed_R < 0:
             raise Exception('StripLinePort: Feed_R must be >= 0')
 
-    def _current_probes(self, mesh, start, ns, ne, ml):
+    def _current_probes(self, start, ns, ne, ml):
         """Two current loops round the strip (its width plus half a cell, two cells either side in height)."""
-        hl, wl = mesh.GetLines(self.height_ny), mesh.GetLines(self.width_ny)
-        hi = int(np.argmin(np.abs(hl - start[self.height_ny])))
-        hi = max(2, min(hi, len(hl) - 3))
-        w0 = int(np.argmin(np.abs(wl - ns[self.width_ny])))
-        w0 = max(1, min(w0, len(wl) - 1))
-        w1 = int(np.argmin(np.abs(wl - ne[self.width_ny])))
-        w1 = max(0, min(w1, len(wl) - 2))
+        p, h, w = self.prop_ny, self.height_ny, self.width_ny
+        hl, wl = self.CSX.GetGrid().GetLines(h), self.CSX.GetGrid().GetLines(w)
+        hi = max(2, min(int(np.argmin(np.abs(hl - start[h]))), len(hl) - 3))
+        w0 = max(1, min(int(np.argmin(np.abs(wl - ns[w]))), len(wl) - 1))
+        w1 = max(0, min(int(np.argmin(np.abs(wl - ne[w]))), len(wl) - 2))
         b0, b1 = np.zeros(3), np.zeros(3)
-        b0[self.width_ny], b0[self.height_ny] = 0.5 * (wl[w0 - 1] + wl[w0]), 0.5 * (hl[hi - 2] + hl[hi - 1])
-        b1[self.width_ny], b1[self.height_ny] = 0.5 * (wl[w1] + wl[w1 + 1]), 0.5 * (hl[hi + 1] + hl[hi + 2])
-        self.I_filenames = []
+        b0[w], b0[h] = 0.5 * (wl[w0 - 1] + wl[w0]), 0.5 * (hl[hi - 2] + hl[hi - 1])
+        b1[w], b1[h] = 0.5 * (wl[w1] + wl[w1 + 1]), 0.5 * (hl[hi + 1] + hl[hi + 2])
         for n, sfx in enumerate('AB'):
-            i0, i1 = b0.copy(), b1.copy()
-            i0[self.prop_ny] = i1[self.prop_ny] = 0.5 * (ml[n] + ml[n + 1])
-            name = self.lbl_temp.format('it') + sfx
-            self.I_filenames.append(name)
-            pr = self._AddProbe(self.CSX, name, p_type=1, weight=self.direction, norm_dir=self.prop_ny)
-            pr.AddBox(i0, i1)
-            self.port_props.append(pr)
+            b0[p] = b1[p] = 0.5 * (ml[n] + ml[n + 1])
+            self._probe('it', sfx, b0, b1, p_type=1, weight=self.direction, norm_dir=p)
 
 
 class CPWPort(StripLinePort):
@@ -582,59 +495,42 @@ class CPWPort(StripLinePort):
     def __init__(self, CSX, port_nr, metal_prop, start, stop, prop_dir, exc_dir, gap_width, excite=0, **kw):
         Port.__init__(self, CSX, port_nr=port_nr, start=start, stop=stop, excite=excite, **kw)
         start, stop = self.start, self.stop
-        self.prop_ny = C.ny_dir(prop_dir)
-        self.width_ny = C.ny_dir(exc_dir)
-        if self.width_ny == self.prop_ny:
+        p, w = self.prop_ny, self.width_ny = C.ny_dir(prop_dir), C.ny_dir(exc_dir)
+        if w == p:
             raise Exception('CPWPort: exc_dir must differ from prop_dir')
-        self.height_ny = 3 - self.prop_ny - self.width_ny
-        if start[self.height_ny] != stop[self.height_ny]:
+        h = self.height_ny = 3 - p - w
+        if start[h] != stop[h]:
             raise Exception('CPWPort: start/stop in height direction must be equal')
-        self.direction = np.sign(stop[self.prop_ny] - start[self.prop_ny])
+        self.direction = np.sign(stop[p] - start[p])
         if self.direction == 0:
             raise Exception('CPWPort: start/stop in prop direction must differ')
-        feed_shift, feed_R = kw.get('FeedShift', 0), kw.get('Feed_R', np.inf)
+        feed_R = kw.get('Feed_R', np.inf)
         ns, ne = np.minimum(start, stop), np.maximum(start, stop)
         metal_prop.AddBox(start, stop, priority=self.priority)
         self.port_props.append(metal_prop)
-        mpos = 0.5 * (ns[self.prop_ny] + ne[self.prop_ny])
-        if 'MeasPlaneShift' in kw:
-            mpos = start[self.prop_ny] + self.direction * kw['MeasPlaneShift']
-        mesh = CSX.GetGrid()
-        ml = _three_lines(mesh, self.prop_ny, mpos, self.direction)
-        self.measplane_shift = abs(ml[1] - start[self.prop_ny])
-        self.U_delta = np.diff(ml)
-        ipos = ml[:2] + np.diff(ml) / 2.0
-        self.I_delta = np.diff(ipos)
-        wc = 0.5 * (ns[self.width_ny] + ne[self.width_ny])
-        hw = 0.5 * (ne[self.width_ny] - ns[self.width_ny])
+        ml = self._planes(kw)
+        wc = 0.5 * (ns[w] + ne[w])
         g0, g1 = np.zeros(3), np.zeros(3)
-        g0[self.width_ny], g1[self.width_ny] = hw, hw + gap_width
-        self.U_filenames = []
-        for n, pair in enumerate((('A1', 'A2'), ('B1', 'B2'), ('C1', 'C2'))):
+        g0[w] = 0.5 * (ne[w] - ns[w])
+        g1[w] = g0[w] + gap_width
+        for n, plane in enumerate('ABC'):
             pt = np.zeros(3)
-            pt[self.prop_ny], pt[self.width_ny], pt[self.height_ny] = ml[n], wc, start[self.height_ny]
-            for sfx, sgn in zip(pair, (-1, 1)):
-                name = self.lbl_temp.format('ut') + sfx
-                self.U_filenames.append(name)
-                pr = self._AddProbe(CSX, name, p_type=0, weight=0.5)
-                pr.AddBox(pt + sgn * g0, pt + sgn * g1, priority=self.priority)
-                self.port_props.append(pr)
-        self._current_probes(mesh, start, ns, ne, ml)
+            pt[p], pt[w], pt[h] = ml[n], wc, start[h]
+            for k, sgn in ((1, -1), (2, 1)):
+                self._probe('ut', f'{plane}{k}', pt + sgn * g0, pt + sgn * g1, priority=self.priority, p_type=0,
+                            weight=0.5)
+        self._current_probes(start, ns, ne, ml)
         if excite != 0:
-            lines = mesh.GetLines(self.prop_ny)
-            fi = int(np.argmin(np.abs(lines - (start[self.prop_ny] + feed_shift * self.direction))))
             pt = np.zeros(3)
-            pt[self.prop_ny], pt[self.width_ny], pt[self.height_ny] = lines[fi], wc, start[self.height_ny]
-            for lbl, sgn in (('excite_1', -1), ('excite_2', 1)):
+            pt[p], pt[w], pt[h] = self._feed(kw), wc, start[h]
+            for k, sgn in ((1, -1), (2, 1)):
                 ev = np.zeros(3)
-                ev[self.width_ny] = sgn * excite
-                exc = CSX.AddExcitation(self.lbl_temp.format(lbl), exc_type=0, exc_val=ev, delay=self.delay)
-                exc.AddBox(pt + sgn * g0, pt + sgn * g1, priority=self.priority)
-                self.port_props.append(exc)
+                ev[w] = sgn * excite
+                self._excitation(f'excite_{k}', ev).AddBox(pt + sgn * g0, pt + sgn * g1, priority=self.priority)
         rp = np.zeros(3)
-        rp[self.prop_ny], rp[self.width_ny], rp[self.height_ny] = start[self.prop_ny], wc, start[self.height_ny]
+        rp[p], rp[w], rp[h] = start[p], wc, start[h]
         if feed_R > 0 and not np.isinf(feed_R):
-            el = CSX.AddLumpedElement(self.lbl_temp.format('resist'), ny=self.width_ny, R=2 * feed_R)
+            el = CSX.AddLumpedElement(self.lbl_temp.format('resist'), ny=w, R=2 * feed_R)
             for sgn in (-1, 1):
                 el.AddBox(rp + sgn * g0, rp + sgn * g1, priority=self.priority)
             self.port_props.append(el)
@@ -651,47 +547,30 @@ class CurvePort(Port):
     def __init__(self, CSX, port_nr, R, start, stop, excite=0, **kw):
         super().__init__(CSX, port_nr=port_nr, start=start, stop=stop, excite=excite, **kw)
         self.R = self.Z_ref = R
-        mesh = CSX.GetGrid()
-        lines = [mesh.GetLines(n) for n in range(3)]
+        lines = [CSX.GetGrid().GetLines(n) for n in range(3)]
         self.port_dir = d0 = int(np.argmax(np.abs(self.stop - self.start)))
         d1, d2 = (d0 + 1) % 3, (d0 + 2) % 3
         ns, ne = (self.start, self.stop) if self.start[d0] <= self.stop[d0] else (self.stop, self.start)
-        snap = lambda v, ln: int(np.argmin(np.abs(ln - v)))
-        si = [snap(ns[d], lines[d]) for d in range(3)]
-        ei = [snap(ne[d], lines[d]) for d in range(3)]
-        if abs(si[d0] - ei[d0]) != 1:
-            ps = [0, 0, 0]
-            ps[d0] = snap(0.5 * (ns[d0] + ne[d0]), lines[d0])
-            ps[d1] = snap(0.5 * (ns[d1] + ne[d1]), lines[d1])
-            ps[d2] = snap(0.5 * (ns[d2] + ne[d2]), lines[d2])
-            pe = list(ps)
-            pe[d0] = ps[d0] + 1
-            es = np.array([lines[d][ps[d]] for d in range(3)])
-            ee = np.array([lines[d][pe[d]] for d in range(3)])
+        snap = lambda v, d: int(np.argmin(np.abs(lines[d] - v)))
+        ps, pe = [snap(ns[d], d) for d in range(3)], [snap(ne[d], d) for d in range(3)]
+        joined = abs(ps[d0] - pe[d0]) != 1                          # not one cell apart: the edge in the middle
+        if joined:
+            ps = [snap(0.5 * (ns[d] + ne[d]), d) for d in range(3)]
+            pe = [v + (d == d0) for d, v in enumerate(ps)]
+        es, ee = (np.array([lines[d][q[d]] for d in range(3)]) for q in (ps, pe))
+        if joined:
             metal = CSX.AddMetal(self.lbl_temp.format('PEC'))
             self.port_props.append(metal)
             for up in (ns, ne):
                 near = es if np.linalg.norm(up - es) <= np.linalg.norm(up - ee) else ee
                 metal.AddCurve([[up[0], near[0]], [up[1], near[1]], [up[2], near[2]]], priority=self.priority)
-        else:
-            ps, pe = si, ei
-            es = np.array([lines[d][ps[d]] for d in range(3)])
-            ee = np.array([lines[d][pe[d]] for d in range(3)])
-        dl = lambda d, k: lines[d][k] - lines[d][k - 1]
         i0, i1 = es.copy(), ee.copy()
-        i0[d1] -= dl(d1, ps[d1]) / 2
-        i1[d1] += dl(d1, ps[d1] + 1) / 2
-        i0[d2] -= dl(d2, ps[d2]) / 2
-        i1[d2] += dl(d2, ps[d2] + 1) / 2
+        for d in (d1, d2):
+            i0[d] -= (lines[d][ps[d]] - lines[d][ps[d] - 1]) / 2
+            i1[d] += (lines[d][ps[d] + 1] - lines[d][ps[d]]) / 2
         i0[d0] = i1[d0] = 0.5 * (es[d0] + ee[d0])
-        self.U_filenames = [self.lbl_temp.format('ut')]
-        pr = self._AddProbe(CSX, self.U_filenames[0], p_type=0, weight=-1)
-        pr.AddBox(es, ee)
-        self.port_props.append(pr)
-        self.I_filenames = [self.lbl_temp.format('it')]
-        pr = self._AddProbe(CSX, self.I_filenames[0], p_type=1, weight=1)
-        pr.AddBox(i0, i1)
-        self.port_props.append(pr)
+        self._probe('ut', '', es, ee, p_type=0, weight=-1)
+        self._probe('it', '', i0, i1, p_type=1, weight=1)
         if R > 0 and not np.isinf(R):
             el = CSX.AddLumpedElement(self.lbl_temp.format('resist'), ny=d0, R=R)
             el.AddBox(es, ee, priority=self.priority)
@@ -701,10 +580,7 @@ class CurvePort(Port):
             sh.AddBox(es, ee, priority=self.priority)
             self.port_props.append(sh)
         if excite:
-            vec = excite * (np.array(pe) != np.array(ps)).astype(float)
-            exc = CSX.AddExcitation(self.lbl_temp.format('excite'), exc_type=0, exc_val=vec, delay=self.delay)
-            exc.AddBox(es, ee, priority=self.priority)
-            self.port_props.append(exc)
+            self._excitation('excite', excite * (np.array(pe) != np.array(ps))).AddBox(es, ee, priority=self.priority)
 
     def CalcPort(self, sim_path, freq, ref_impedance=None, ref_plane_shift=None, signal_type='pulse'):
         if ref_impedance is None:

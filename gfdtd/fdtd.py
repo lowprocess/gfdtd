@@ -12,7 +12,7 @@ kicad2ems's build_fdtd) written for openEMS runs here by swapping the two import
 FDTD.Write2XML / ReadFromXML use openEMS's XML (an <openEMS> file with <FDTD> and <ContinuousStructure>):
 `python -m gfdtd model.xml` runs a file written by openEMS (or by AppCSXCAD's tools) like `openEMS model.xml`.
 """
-import glob, os, sys
+import contextlib, glob, os, sys
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -67,9 +67,7 @@ class openEMS:                                                       # noqa: N80
         self.csx = CSX
 
     def AddLumpedPort(self, port_nr, R, start, stop, p_dir, excite=0, **kw):
-        port = LumpedPort(self.csx, port_nr, R, start, stop, p_dir, excite, **kw)
-        self.ports.append(port)
-        return port
+        return self._add(LumpedPort, port_nr, R, start, stop, p_dir, excite, **kw)
 
     def _add(self, cls, *args, **kw):
         if self.csx is None:
@@ -175,45 +173,39 @@ class openEMS:                                                       # noqa: N80
         numThreads: the CPU core's threads (0: all); openEMS's debug options are accepted and ignored; backend:
         'auto', 'cupy', 'core', 'numpy'; log: a file for the output (appended) in place of stdout. On the GPU a run
         has a stream of its own, so that runs in several threads overlap."""
-        if log is None:
-            return self._run(sim_path, cleanup, setup_only, verbose, backend, lambda line: print(line, flush=True), **kw)
-        with open(log, 'a') as fh:
-            def out(line):
-                fh.write(line + '\n')
-                fh.flush()
-            return self._run(sim_path, cleanup, setup_only, verbose, backend, out, **kw)
-
-    def _run(self, sim_path, cleanup, setup_only, verbose, backend, out, **kw):
-        from .operator import build
-        from .engine import resolve_backend
-        sim_path = os.path.abspath(sim_path)
-        if cleanup and os.path.isdir(sim_path):
-            for pat in OUTPUTS:
-                for fn in glob.glob(os.path.join(sim_path, pat)):
-                    os.remove(fn)
-        os.makedirs(sim_path, exist_ok=True)
         from . import __version__
-        out(f" ---------------------------------------------------------------------- \n"
-            f" | gfdtd -- version {__version__} -- GPU FDTD, openEMS / CSXCAD compatible\n"
-            f" ---------------------------------------------------------------------- ")
-        self.op = op = build(self.csx, self.settings(), log=out)
-        if resolve_backend(backend or self.backend) == 'cupy':
-            import cupy
-            with cupy.cuda.Stream(non_blocking=True) as stream:
-                r = self._engine(op, backend, setup_only, verbose, out, sim_path, **kw)
-                stream.synchronize()
-            return r
-        return self._engine(op, backend, setup_only, verbose, out, sim_path, **kw)
+        from .operator import build
+        from .engine import Engine, resolve_backend, gpu_info, core_info
+        with contextlib.ExitStack() as stack:
+            if log is None:
+                out = lambda line: print(line, flush=True)
+            else:
+                fh = stack.enter_context(open(log, 'a'))
 
-    def _engine(self, op, backend, setup_only, verbose, out, sim_path, **kw):
-        from .engine import Engine, gpu_info, core_info
-        eng = Engine(op, backend or self.backend)
-        if eng.be.name == 'core' and int(kw.get('numThreads') or 0) > 0:
-            eng.be.core.set_threads(int(kw['numThreads']))
-        out(f"Engine: {eng.be.name}" + {'cupy': f" ({gpu_info()[1]})", 'core': f" ({core_info()[1]})"}.get(eng.be.name, ''))
-        if setup_only:
-            return 0
-        self.result = eng.run(sim_path, self.nr_ts, self.end_crit, verbose=1 if verbose is None else verbose, out=out)
+                def out(line):
+                    fh.write(line + '\n')
+                    fh.flush()
+            sim_path = os.path.abspath(sim_path)
+            if cleanup and os.path.isdir(sim_path):
+                for pat in OUTPUTS:
+                    for fn in glob.glob(os.path.join(sim_path, pat)):
+                        os.remove(fn)
+            os.makedirs(sim_path, exist_ok=True)
+            out(f" ---------------------------------------------------------------------- \n"
+                f" | gfdtd -- version {__version__} -- GPU FDTD, openEMS / CSXCAD compatible\n"
+                f" ---------------------------------------------------------------------- ")
+            self.op = build(self.csx, self.settings(), log=out)
+            if resolve_backend(backend or self.backend) == 'cupy':
+                import cupy
+                stack.enter_context(cupy.cuda.Stream(non_blocking=True))
+            eng = Engine(self.op, backend or self.backend)
+            if eng.be.name == 'core' and int(kw.get('numThreads') or 0) > 0:
+                eng.be.core.set_threads(int(kw['numThreads']))
+            out(f"Engine: {eng.be.name}" + {'cupy': f" ({gpu_info()[1]})", 'core': f" ({core_info()[1]})"}.get(eng.be.name, ''))
+            if not setup_only:
+                self.result = eng.run(sim_path, self.nr_ts, self.end_crit, verbose=1 if verbose is None else verbose,
+                                      out=out)
+            eng.be.sync()
         return 0
 
     def SetAbort(self, val):
@@ -231,75 +223,39 @@ def read_probe(path):
     return a[:, 0], a[:, 1]
 
 
-def dft(t, val, freq):
-    """openEMS's DFT_time2freq for a pulse: the single-sided spectrum 2 dt sum(val exp(-j w t))."""
-    freq = np.atleast_1d(np.asarray(freq, float))
-    out = np.empty(len(freq), complex)
-    for i in range(0, len(freq), 64):                               # blocks: (64, nt) at a time
-        f = freq[i:i + 64]
-        out[i:i + 64] = np.exp(-2j * np.pi * np.outer(f, t)) @ val
-    return 2 * out * (t[1] - t[0])
+dft = P.dft_time2freq          # openEMS's DFT_time2freq of a pulse: 2 dt sum(val exp(-j w t))
 
 
-class LumpedPort:
+class LumpedPort(P.Port):
     """openEMS's LumpedPort: a resistor R across the box along p_dir, a soft E excitation (when excite != 0), a
     voltage probe through its middle and a current probe across its middle; CalcPort gives uf_tot, if_tot, uf_inc,
     uf_ref, if_inc, if_ref (and the time signals ut_*, it_*) as openEMS's does."""
     def __init__(self, CSX, port_nr, R, start, stop, exc_dir, excite=0, **kw):
-        self.CSX, self.number, self.R, self.excite = CSX, port_nr, float(R), excite
-        self.start, self.stop = np.array(start, float), np.array(stop, float)
-        self.exc_ny = C.ny_dir(exc_dir)
-        self.priority = kw.get('priority', 0)
-        prefix = kw.get('PortNamePrefix', '')
-        lbl = prefix + 'port_{}' + f'_{port_nr}'
-        a = self.exc_ny
+        super().__init__(CSX, port_nr, start, stop, excite, **kw)
+        self.R = float(R)
+        a = self.exc_ny = C.ny_dir(exc_dir)
         self.direction = np.sign(self.stop[a] - self.start[a])
         if self.direction == 0:
             raise ValueError('LumpedPort: start and stop may not be identical in excitation direction')
-        if self.R > 0:
-            el = CSX.AddLumpedElement(lbl.format('resist'), ny=a, caps=True, R=self.R)
-        else:
-            el = CSX.AddMetal(lbl.format('resist'))
+        lbl = self.lbl_temp.format('resist')
+        el = CSX.AddLumpedElement(lbl, ny=a, caps=True, R=self.R) if self.R > 0 else CSX.AddMetal(lbl)
         el.AddBox(self.start, self.stop, priority=self.priority)
+        self.port_props.append(el)
         if excite != 0:
             vec = np.zeros(3)
             vec[a] = -1 * self.direction * excite
-            CSX.AddExcitation(lbl.format('excite'), exc_type=0, exc_val=vec, delay=kw.get('delay', 0)).AddBox(
-                self.start, self.stop, priority=self.priority)
+            self._excitation('excite', vec).AddBox(self.start, self.stop, priority=self.priority)
         mid = 0.5 * (self.start + self.stop)
         u0, u1 = mid.copy(), mid.copy()
         u0[a], u1[a] = self.start[a], self.stop[a]
-        self.U_filenames = [lbl.format('ut')]
-        CSX.AddProbe(self.U_filenames[0], p_type=0, weight=-1).AddBox(u0, u1)
+        self._probe('ut', '', u0, u1, p_type=0, weight=-1)
         i0, i1 = self.start.copy(), self.stop.copy()
         i0[a] = i1[a] = mid[a]
-        self.I_filenames = [lbl.format('it')]
-        CSX.AddProbe(self.I_filenames[0], p_type=1, weight=self.direction, norm_dir=a).AddBox(i0, i1)
-        self.Z_ref = None
-
-    def ReadUIData(self, sim_path, freq, signal_type='pulse'):
-        self.u_time, self.ut_tot = read_probe(os.path.join(sim_path, self.U_filenames[0]))
-        self.i_time, self.it_tot = read_probe(os.path.join(sim_path, self.I_filenames[0]))
-        self.uf_tot = dft(self.u_time, self.ut_tot, freq)
-        self.if_tot = dft(self.i_time, self.it_tot, freq)
+        self._probe('it', '', i0, i1, p_type=1, weight=self.direction, norm_dir=a)
 
     def CalcPort(self, sim_path, freq, ref_impedance=None, ref_plane_shift=None, signal_type='pulse'):
-        self.ReadUIData(sim_path, freq, signal_type)
         self.Z_ref = self.R if ref_impedance is None else ref_impedance
-        Z = self.Z_ref
-        self.uf_inc = 0.5 * (self.uf_tot + self.if_tot * Z)
-        self.if_inc = 0.5 * (self.if_tot + self.uf_tot / Z)
-        self.uf_ref = self.uf_tot - self.uf_inc
-        self.if_ref = self.if_inc - self.if_tot
-        if np.isscalar(Z):
-            n = min(len(self.ut_tot), len(self.it_tot))
-            self.ut_inc = 0.5 * (self.ut_tot[:n] + self.it_tot[:n] * Z)
-            self.it_inc = 0.5 * (self.it_tot[:n] + self.ut_tot[:n] / Z)
-            self.ut_ref = self.ut_tot[:n] - self.ut_inc
-            self.it_ref = self.it_inc - self.it_tot[:n]
-        self.P_inc = 0.5 * np.real(self.uf_inc * np.conj(self.if_inc))
-        self.P_ref = 0.5 * np.real(self.uf_ref * np.conj(self.if_ref))
-        self.P_acc = 0.5 * np.real(self.uf_tot * np.conj(self.if_tot))
+        super().CalcPort(sim_path, freq, ref_impedance, None, signal_type)
 
 
 def main(argv=None):

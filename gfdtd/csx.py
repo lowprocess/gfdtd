@@ -67,16 +67,6 @@ _FUNCS = dict(sin=np.sin, cos=np.cos, tan=np.tan, asin=np.arcsin, acos=np.arccos
               **{'if': None})
 
 
-def _fparser_to_python(expr):
-    """A CSXCAD (fparser) expression as a numpy one: ^ is the power, = equality, & | logical and / or, if(c, a, b)."""
-    e = str(expr).strip()
-    e = e.replace('^', '**')
-    e = re.sub(r'(?<![<>!=])=(?!=)', '==', e)
-    e = e.replace('&', ' * ').replace('|', ' + ')                    # on 0 / 1 values; | then clipped below
-    e = re.sub(r'\bif\s*\(', '_if(', e)
-    return e
-
-
 def evaluate(expr, coords):
     """A weight / mode function on arrays: coords = (x, y, z) relative to its origin (drawing units). Returns an array
     broadcast to the coordinates; nan and inf become 0, as openEMS's mode matching does."""
@@ -90,7 +80,10 @@ def evaluate(expr, coords):
                   t=np.arcsin(1) - np.arctan(z / rho),
                   _if=lambda c, a, b: np.where(np.asarray(c) != 0, a, b))
         ns.pop('if')
-        v = eval(compile(_fparser_to_python(expr), '<weight function>', 'eval'), {'__builtins__': {}}, ns)
+        # CSXCAD's (fparser's) syntax as numpy's: ^ the power, = equality, & | and / or (on 0 / 1), if(c, a, b)
+        e = re.sub(r'(?<![<>!=])=(?!=)', '==', str(expr).strip().replace('^', '**'))
+        e = re.sub(r'\bif\s*\(', '_if(', e.replace('&', ' * ').replace('|', ' + '))
+        v = eval(compile(e, '<weight function>', 'eval'), {'__builtins__': {}}, ns)
         v = np.broadcast_to(np.asarray(v, float), x.shape).copy()
     v[~np.isfinite(v)] = 0.0
     return v
@@ -373,9 +366,6 @@ class Excitation(Property):
     def GetExcitType(self):
         return self.exc_type
 
-    def SetEnabled(self, val):
-        self.enabled = bool(val)
-
     def GetEnabled(self):
         return self.enabled
 
@@ -424,7 +414,7 @@ class ProbeBox(Property):
         self.mode_function = ['', '', ''] if mode_function is None else [str(f) for f in mode_function]
         self.mode_file, self.mode_origin = '', [0.0, 0.0, 0.0]
         self.frequency = [] if frequency is None else _vec(frequency)
-        self.extra = {k: v for k, v in kw.items()}
+        self.extra = dict(kw)
 
     def GetProbeType(self):
         return self.p_type
@@ -616,6 +606,10 @@ def _write(top, path):
         fh.write(b'\n')
 
 
+def _xyz(v, keys='XYZ'):
+    return dict(zip(keys, map(_fmt, v)))
+
+
 def _three(v):
     return ",".join(_fmt(x) for x in (v, 1.0, 1.0)) if np.isscalar(v) else ",".join(_fmt(x) for x in v)
 
@@ -663,41 +657,38 @@ def _write_property(parent, p, pid):
         ET.SubElement(el, 'Property', **pa)
     if isinstance(p, Excitation):
         if any(p.weight_origin):
-            ET.SubElement(el, 'WeightOrigin', **dict(zip('XYZ', (_fmt(v) for v in p.weight_origin))))
+            ET.SubElement(el, 'WeightOrigin', **_xyz(p.weight_origin))
         ET.SubElement(el, 'Weight', **dict(zip('XYZ', p.weight)))
-    if isinstance(p, ProbeBox) and not isinstance(p, DumpBox):
-        if p.frequency:
-            ET.SubElement(el, 'FD_Samples').text = ",".join(f"{f:.15g}" for f in p.frequency)
+    if isinstance(p, (ProbeBox, DumpBox)) and p.frequency:
+        ET.SubElement(el, 'FD_Samples').text = ",".join(f"{f:.15g}" for f in p.frequency)
+    if isinstance(p, ProbeBox):
         if any(p.mode_function):
             ET.SubElement(el, 'ModeFunction', **dict(zip('XYZ', p.mode_function)))
         if any(p.mode_origin):
-            ET.SubElement(el, 'ModeOrigin', **dict(zip('XYZ', (_fmt(v) for v in p.mode_origin))))
-    if isinstance(p, DumpBox) and p.frequency:
-        ET.SubElement(el, 'FD_Samples').text = ",".join(f"{f:.15g}" for f in p.frequency)
+            ET.SubElement(el, 'ModeOrigin', **_xyz(p.mode_origin))
 
 
 def _write_primitive(parent, q):
     pr = dict(Priority=str(q.priority))
-    if isinstance(q, Box):
-        el = ET.SubElement(parent, 'Box', **pr)
-        ET.SubElement(el, 'P1', X=_fmt(q.start[0]), Y=_fmt(q.start[1]), Z=_fmt(q.start[2]))
-        ET.SubElement(el, 'P2', X=_fmt(q.stop[0]), Y=_fmt(q.stop[1]), Z=_fmt(q.stop[2]))
-    elif isinstance(q, Cylinder):
-        extra = dict(ShellWidth=_fmt(q.shell_width)) if isinstance(q, CylindricalShell) else {}
-        el = ET.SubElement(parent, q.kind, **pr, Radius=_fmt(q.radius), **extra)
-        ET.SubElement(el, 'P1', X=_fmt(q.start[0]), Y=_fmt(q.start[1]), Z=_fmt(q.start[2]))
-        ET.SubElement(el, 'P2', X=_fmt(q.stop[0]), Y=_fmt(q.stop[1]), Z=_fmt(q.stop[2]))
+    if isinstance(q, (Box, Cylinder)):
+        if isinstance(q, Cylinder):
+            pr['Radius'] = _fmt(q.radius)
+        if isinstance(q, CylindricalShell):
+            pr['ShellWidth'] = _fmt(q.shell_width)
+        el = ET.SubElement(parent, q.kind, **pr)
+        ET.SubElement(el, 'P1', **_xyz(q.start))
+        ET.SubElement(el, 'P2', **_xyz(q.stop))
     elif isinstance(q, Curve):
         el = ET.SubElement(parent, 'Curve', **pr)
         for P in q.points:
-            ET.SubElement(el, 'Vertex', X=_fmt(P[0]), Y=_fmt(P[1]), Z=_fmt(P[2]))
+            ET.SubElement(el, 'Vertex', **_xyz(P))
     else:                                                           # Polygon, LinPoly
         a = dict(pr, Elevation=_fmt(q.elevation), NormDir=str(q.norm_dir), QtyVertices=str(q.points.shape[1]))
         if isinstance(q, LinPoly):
             a['Length'] = _fmt(q.length)
         el = ET.SubElement(parent, q.kind, **a)
-        for u, v in q.points.T:
-            ET.SubElement(el, 'Vertex', X1=_fmt(u), X2=_fmt(v))
+        for P in q.points.T:
+            ET.SubElement(el, 'Vertex', **_xyz(P, ('X1', 'X2')))
 
 
 def _point(el):
@@ -771,11 +762,10 @@ def _read_property(pe, skipped):
         pri = int(float(q.get('Priority', 0)))
         if q.tag == 'Box':
             p.AddBox(_point(q.find('P1')), _point(q.find('P2')), priority=pri)
-        elif q.tag == 'Cylinder':
-            p.AddCylinder(_point(q.find('P1')), _point(q.find('P2')), float(q.get('Radius')), priority=pri)
-        elif q.tag == 'CylindricalShell':
-            p.AddCylindricalShell(_point(q.find('P1')), _point(q.find('P2')), float(q.get('Radius')),
-                                  float(q.get('ShellWidth')), priority=pri)
+        elif q.tag in ('Cylinder', 'CylindricalShell'):
+            shell = [float(q.get('ShellWidth'))] if q.tag == 'CylindricalShell' else []
+            getattr(p, 'Add' + q.tag)(_point(q.find('P1')), _point(q.find('P2')), float(q.get('Radius')), *shell,
+                                      priority=pri)
         elif q.tag == 'Curve':
             p.AddCurve(np.array([_point(v) for v in q.findall('Vertex')]).T, priority=pri)
         elif q.tag in ('Polygon', 'LinPoly'):

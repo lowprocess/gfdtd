@@ -56,10 +56,6 @@ class nf2ff:                                                         # noqa: N80
                     self.faces.append((a, 1 if side else -1))
         self.theta = self.phi = self.center = None
 
-    def _files(self, sim_path, n):
-        tag = f"_{n}" if len(self.faces) > 1 else ''
-        return (os.path.join(sim_path, f"{self.e_file}{tag}.h5"), os.path.join(sim_path, f"{self.h_file}{tag}.h5"))
-
     def CalcNF2FF(self, sim_path, freq, theta, phi, radius=1, center=(0, 0, 0), outfile=None, read_cached=True,
                   verbose=0):
         """The far field at radius (m) over theta, phi (degrees), phase centre `center` (m); written to outfile
@@ -75,7 +71,8 @@ class nf2ff:                                                         # noqa: N80
                 return r
         faces = []
         for n, (a, sgn) in enumerate(self.faces):
-            fe, fh = self._files(sim_path, n)
+            tag = f"_{n}" if len(self.faces) > 1 else ''          # the dump's file per box (one: no number)
+            fe, fh = (os.path.join(sim_path, f"{name}{tag}.h5") for name in (self.e_file, self.h_file))
             if os.path.exists(fe) and os.path.exists(fh):
                 faces.append(_face(fe, fh, a, sgn, freq))
         if not faces:
@@ -84,17 +81,10 @@ class nf2ff:                                                         # noqa: N80
             for side, pos in ((0, self.start[a]), (1, self.stop[a])):
                 kind = self.mirror[2 * a + side]
                 if kind:
-                    faces += [_image(f, a, pos * _unit(self.CSX), kind) for f in faces]
+                    faces += [_image(f, a, pos * self.CSX.GetGrid().GetDeltaUnit(), kind) for f in faces]
         res = far_field(faces, freq, np.radians(theta), np.radians(phi), radius, np.asarray(center, float))
         write_result(fn, freq, np.radians(theta), np.radians(phi), radius, res)
         return nf2ff_results(fn)
-
-
-def _unit(CSX):
-    try:
-        return float(CSX.GetGrid().GetDeltaUnit())
-    except AttributeError:
-        return 1.0
 
 
 def _read_fd(path, freq):

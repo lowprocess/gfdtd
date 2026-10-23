@@ -53,16 +53,13 @@ class Region:
         xp = be.xp
         self.d, self.xp, self.be = d, xp, be
         self.gpu = getattr(be, 'name', '') == 'cupy' and d['field'] in ('E', 'H', 'J')
-        if self.gpu:
-            self.args = tuple(np.int32(v) for v in ({'E': 0, 'H': 1, 'J': 2}[d['field']], d.get('mode') != 'node',
-                                                    *d['lo'], *[h - l + 1 for l, h in zip(d['lo'], d['hi'])]))
-            self.shape = tuple(h - l + 1 for l, h in zip(d['lo'], d['hi']))
-            self.omega = xp.asarray(2 * np.pi * np.asarray(d['fd'] or [0.0]), np.float32)
-            return
-        self.lo, self.hi = d['lo'], d['hi']
+        self.lo, self.hi, f = d['lo'], d['hi'], d['field']
         self.node = d.get('mode') == 'node'
         self.shape = tuple(h - l + 1 for l, h in zip(self.lo, self.hi))
-        f = d['field']
+        if self.gpu:
+            self.args = tuple(np.int32(v) for v in ({'E': 0, 'H': 1, 'J': 2}[f], not self.node, *self.lo, *self.shape))
+            self.omega = xp.asarray(2 * np.pi * np.asarray(d['fd'] or [0.0]), np.float32)
+            return
         self.ext, self.scale, self.count = [], [], []               # per component: edge range, scale, edges averaged
         for a in range(3):
             lo, hi = list(self.lo), list(self.hi)
@@ -73,14 +70,8 @@ class Region:
                 else:
                     hi[b] += 1
             self.ext.append((lo, hi, across))
-            if f == 'E':
-                s_ = np.where(op.lE[a] > 0, 1.0 / np.where(op.lE[a] > 0, op.lE[a], 1), 0.0)
-            elif f == 'H':
-                s_ = np.where(op.lH[a] > 0, 1.0 / np.where(op.lH[a] > 0, op.lH[a], 1), 0.0)
-            elif f == 'J':
-                s_ = np.where(op.aE[a] > 0, 1.0 / np.where(op.aE[a] > 0, op.aE[a], 1), 0.0)
-            else:                                                   # Jc: kappa E
-                s_ = np.where(op.lE[a] > 0, op.kappa_E[a] / np.where(op.lE[a] > 0, op.lE[a], 1), 0.0)
+            den = {'E': op.lE, 'H': op.lH, 'J': op.aE, 'Jc': op.lE}[f][a]       # 1 / l, 1 / l', 1 / A', kappa / l
+            s_ = np.where(den > 0, (op.kappa_E[a] if f == 'Jc' else 1.0) / np.where(den > 0, den, 1), 0.0)
             self.scale.append(xp.asarray(_take(np, s_, lo, hi), np.float32))
             if self.node:                                           # the edges that exist, per point
                 exists = (op.lE[a] > 0) if f != 'H' else (op.iv[a] > 0)
@@ -229,7 +220,6 @@ class Dumps:
                 continue
             data = acc * np.float32(2 * self.dts)
             data = self.be.cp.asnumpy(data) if self.xp is not np else data
-            fn = os.path.join(self.path, r.d['name'] + '.h5')
-            write_h5(fn, r.d, r.d['fd'], data)
-            out.append(fn)
+            out.append(os.path.join(self.path, r.d['name'] + '.h5'))
+            write_h5(out[-1], r.d, r.d['fd'], data)
         return out

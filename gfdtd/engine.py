@@ -245,55 +245,52 @@ class NumpyBackend:
             np.subtract.at(v, self.db_idx, self.db_vi * self.db_h * self.db_i)
             self.db_i[:] = self.db_ka * self.db_i + self.db_kb * (v[self.db_idx] - old)
 
-    def _pml(self, sl, field):
-        """One slab's psi update and terms (numpy): the slab's axis moved first."""
-        a, n = sl['axis'], sl['n']
-        t1, t2 = (a + 1) % 3, (a + 2) % 3
-        s0 = sl['e0'] if field == 'E' else sl['h0']
-        shp = (n,) + tuple(op_n for b, op_n in enumerate(self.op.shape) if b != a)
-        b_, c_ = (sl['bE'], sl['cE']) if field == 'E' else (sl['bH'], sl['cH'])
-        b_, c_ = b_.reshape(-1, 1, 1), c_.reshape(-1, 1, 1)
-        mv = lambda F: np.moveaxis(F, a, 0)
-        psi = (sl['psiE'] if field == 'E' else sl['psiH']).reshape((2,) + shp)
-        if field == 'E':
-            V1, V2, I1, I2, k1, k2 = mv(self.V[t1]), mv(self.V[t2]), mv(self.I[t1]), mv(self.I[t2]), \
-                mv(self.vi[t1]), mv(self.vi[t2])
+    def _pml(self, field):
+        """Each slab's psi update and terms (numpy): the slab's axis moved first."""
+        for sl in self.pml:
+            a, n = sl['axis'], sl['n']
+            t1, t2 = (a + 1) % 3, (a + 2) % 3
+            s0 = sl[field.lower() + '0']
+            b_, c_ = sl['b' + field].reshape(-1, 1, 1), sl['c' + field].reshape(-1, 1, 1)
+            mv = lambda F: np.moveaxis(F, a, 0)
+            psi = sl['psi' + field].reshape((2, n) + tuple(m for b, m in enumerate(self.op.shape) if b != a))
+            if field == 'E':
+                V1, V2, I1, I2, k1, k2 = mv(self.V[t1]), mv(self.V[t2]), mv(self.I[t1]), mv(self.I[t2]), \
+                    mv(self.vi[t1]), mv(self.vi[t2])
 
-            def diff(F):                                            # backward, I[-1] = 0
-                d = F[s0:s0 + n].copy()
-                if s0 > 0:
-                    d -= F[s0 - 1:s0 + n - 1]
-                else:
-                    d[1:] -= F[:n - 1]
-                return d
-            psi[0] = b_ * psi[0] + c_ * diff(I2)
-            V1[s0:s0 + n] -= k1[s0:s0 + n] * psi[0]
-            psi[1] = b_ * psi[1] + c_ * diff(I1)
-            V2[s0:s0 + n] += k2[s0:s0 + n] * psi[1]
-        else:
-            I1, I2, V1, V2, k1, k2 = mv(self.I[t1]), mv(self.I[t2]), mv(self.V[t1]), mv(self.V[t2]), \
-                mv(self.iv[t1]), mv(self.iv[t2])
-            N = V1.shape[0]
+                def diff(F):                                            # backward, I[-1] = 0
+                    d = F[s0:s0 + n].copy()
+                    if s0 > 0:
+                        d -= F[s0 - 1:s0 + n - 1]
+                    else:
+                        d[1:] -= F[:n - 1]
+                    return d
+                psi[0] = b_ * psi[0] + c_ * diff(I2)
+                V1[s0:s0 + n] -= k1[s0:s0 + n] * psi[0]
+                psi[1] = b_ * psi[1] + c_ * diff(I1)
+                V2[s0:s0 + n] += k2[s0:s0 + n] * psi[1]
+            else:
+                I1, I2, V1, V2, k1, k2 = mv(self.I[t1]), mv(self.I[t2]), mv(self.V[t1]), mv(self.V[t2]), \
+                    mv(self.iv[t1]), mv(self.iv[t2])
+                N = V1.shape[0]
 
-            def diff(F):                                            # forward, V[N] = 0
-                d = -F[s0:s0 + n]
-                if s0 + n < N:
-                    d = d + F[s0 + 1:s0 + n + 1]
-                else:
-                    d[:-1] += F[s0 + 1:s0 + n]
-                return d
-            psi[0] = b_ * psi[0] + c_ * diff(V2)
-            I1[s0:s0 + n] += k1[s0:s0 + n] * psi[0]
-            psi[1] = b_ * psi[1] + c_ * diff(V1)
-            I2[s0:s0 + n] -= k2[s0:s0 + n] * psi[1]
+                def diff(F):                                            # forward, V[N] = 0
+                    d = -F[s0:s0 + n]
+                    if s0 + n < N:
+                        d = d + F[s0 + 1:s0 + n + 1]
+                    else:
+                        d[:-1] += F[s0 + 1:s0 + n]
+                    return d
+                psi[0] = b_ * psi[0] + c_ * diff(V2)
+                I1[s0:s0 + n] += k1[s0:s0 + n] * psi[0]
+                psi[1] = b_ * psi[1] + c_ * diff(V1)
+                I2[s0:s0 + n] -= k2[s0:s0 + n] * psi[1]
 
     def pml_h(self):
-        for sl in self.pml:
-            self._pml(sl, 'H')
+        self._pml('H')
 
     def pml_e(self):
-        for sl in self.pml:
-            self._pml(sl, 'E')
+        self._pml('E')
 
     def mur_pre(self):
         if self.op.mur is not None:
@@ -308,7 +305,7 @@ class NumpyBackend:
 
     def excite(self, s):
         if len(self.exc_idx):
-            np.add.at(self.V.reshape(-1), self.exc_idx, self.exc_amp * self.dt(s))
+            self.add(self.V, self.exc_idx, self.exc_amp, s)
 
     def lumped(self):
         v = self.V.reshape(-1)
@@ -401,15 +398,11 @@ class CoreBackend(_Compressed, NumpyBackend):
         self.core.update_e(self.V, self.I, self.code, self.tvv, self.ts, self.tpole, self.tkb, self.tka, self.th,
                            self.P, self.slot, self.pol, self.G, *self.idims, self.ke, self.dtf32)
 
-    def pml_h(self):
+    def _pml(self, f):
+        update = self.core.pml_e if f == 'E' else self.core.pml_h
         for sl in self.pml:
-            self.core.pml_h(self.V, self.I, sl['psiH'], sl['bH'], sl['cH'], sl['kH1'], sl['kH2'], *self.idims,
-                            sl['axis'], sl['h0'], sl['n'])
-
-    def pml_e(self):
-        for sl in self.pml:
-            self.core.pml_e(self.V, self.I, sl['psiE'], sl['bE'], sl['cE'], sl['kE1'], sl['kE2'], *self.idims,
-                            sl['axis'], sl['e0'], sl['n'])
+            update(self.V, self.I, sl['psi' + f], sl['b' + f], sl['c' + f], sl[f'k{f}1'], sl[f'k{f}2'], *self.idims,
+                   sl['axis'], sl[f.lower() + '0'], sl['n'])
 
     def mur_pre(self):
         if self.op.mur is not None:
@@ -446,11 +439,15 @@ class CupyBackend(_Compressed, NumpyBackend):
         if 3 * self.n >= 2 ** 31:                                   # the kernels decode nodes in 32-bit arithmetic
             raise ValueError(f"gfdtd: {self.n / 1e6:.0f} M nodes - the GPU kernels take up to 715 M")
         self.dims = (np.int32(nx), np.int32(ny), np.int32(nz))
-        self.grid = (min((self.n + self.BLOCK - 1) // self.BLOCK, 65535 * 8),)
+        self.grid = self._blocks(self.n)
         self._sparse()
         self._pml_all()
         self._fused()
         self.e_out = cp.zeros(1, np.float64)
+
+    def _blocks(self, m, most=65535 * 8):
+        """The launch grid for m threads (grid-stride kernels: at most `most` blocks)."""
+        return (min((m + self.BLOCK - 1) // self.BLOCK, most),)
 
     def _fused(self):
         """The arguments of the three-launch step (step_h, step_e, step_post). The post kernel runs its excitation,
@@ -527,16 +524,15 @@ class CupyBackend(_Compressed, NumpyBackend):
         and the delayed ones (n: the step) run between them."""
         if self.mode == 'separate':
             return NumpyBackend.step(self, sig, n)
-        g = lambda m: (min((m + self.BLOCK - 1) // self.BLOCK, 65535 * 8),)
         split = self.mode == 'split'
         ns = np.int32(0) if split else self.ns
         psi, b, c, desc = self.hH
         m0, m1, mk, o0, o1 = self.mu
-        self.k['step_h'](g(self.n + self.n_mu), (self.BLOCK,), (self.V, self.I, self.G, *self.dims, self.kh, psi, b, c,
+        self.k['step_h'](self._blocks(self.n + self.n_mu), (self.BLOCK,), (self.V, self.I, self.G, *self.dims, self.kh, psi, b, c,
                                                                   desc, ns, self.boxH, self.code, self.ts, m0, m1,
                                                                   o0, o1, np.int64(self.n_mu)))
         if split:
-            self._pml_k('H')
+            self._pml('H')
         if self.more and n is not None:
             self.excite_more('I', n)
         psi, b, c, desc = self.hE
@@ -545,13 +541,13 @@ class CupyBackend(_Compressed, NumpyBackend):
                                                     *self.dims, self.ke, self.dtf32, psi, b, c, desc, ns,
                                                     self.boxE))
         if split:
-            self._pml_k('E')
+            self._pml('E')
         if self.more and n is not None:
             self.excite_more('V', n)
         n_ex = self.n_ex if sig is not None else 0
         m = n_ex + self.n_pl + self.n_se + self.n_mu
         if m:
-            self.k['step_post'](g(m), (self.BLOCK,), (
+            self.k['step_post'](self._blocks(m), (self.BLOCK,), (
                 self.V, self.exc_idx, self.exc_amp, np.float32(sig or 0.0), np.int64(n_ex),
                 *self.pl, np.int64(self.n_pl), *self.se, self.dtf if self.n_se else np.float32(0),
                 np.int64(self.n_se), m0, m1, mk, o0, o1, np.int64(self.n_mu)))
@@ -589,20 +585,13 @@ class CupyBackend(_Compressed, NumpyBackend):
         d[:, 3] = [sl[key] for sl in self.pml]
         return self.cp.asarray(d.ravel())
 
-    def _pml_k(self, field):
+    def _pml(self, field):
         if not self.pml_M:
             return
         p = self.pmlE if field == 'E' else self.pmlH
-        g = (min((self.pml_M + self.BLOCK - 1) // self.BLOCK, 65535 * 8),)
-        self.k['pml_e' if field == 'E' else 'pml_h'](g, (self.BLOCK,), (
+        self.k['pml_e' if field == 'E' else 'pml_h'](self._blocks(self.pml_M), (self.BLOCK,), (
             self.V, self.I, p['psi'], p['b'], p['c'], p['k1'], p['k2'], *self.dims, p['desc'], np.int32(len(self.pml)),
             np.int64(self.pml_M)))
-
-    def pml_h(self):
-        self._pml_k('H')
-
-    def pml_e(self):
-        self._pml_k('E')
 
     def mur_pre(self):
         if self.op.mur is not None:
@@ -612,10 +601,6 @@ class CupyBackend(_Compressed, NumpyBackend):
         if self.op.mur is not None:
             self._launch('mur_post', len(self.m0), self.V, self.m0, self.m1, self.mk, self.o0, self.o1,
                          np.int64(len(self.m0)))
-
-    def excite(self, s):
-        self._launch('excite', len(self.exc_idx), self.V, self.exc_idx, self.exc_amp, np.float32(s),
-                     np.int64(len(self.exc_idx)))
 
     def add(self, F, idx, amp, val):
         self._launch('excite', len(idx), F, idx, amp, np.float32(val), np.int64(len(idx)))
@@ -642,8 +627,7 @@ class CupyBackend(_Compressed, NumpyBackend):
 
     def field_energy(self):
         self.e_out.fill(0)
-        g = (min((self.n + self.BLOCK - 1) // self.BLOCK, 4096),)
-        self.k['energy'](g, (self.BLOCK,), (self.V, self.I, self.code, self.ts, self.G, *self.dims, self.ke, self.kh,
+        self.k['energy'](self._blocks(self.n, 4096), (self.BLOCK,), (self.V, self.I, self.code, self.ts, self.G, *self.dims, self.ke, self.kh,
                                             self.e_out))
         return self.e_out[0] * (self.op.dt / 2)
 
@@ -670,20 +654,6 @@ class Engine:
         self.op = op
         self.be = make_backend(op, backend, dtype)
 
-    def _open_probes(self, path):
-        out = []
-        for p in self.be.order:
-            fh = open(os.path.join(path, p['name']), 'w')
-            what = 'voltage' if p['field'] == 'V' else 'current'
-            (lo, s), (hi, e) = p['start'], p['stop']
-            u = p['unit']
-            fh.write(f"% time-domain {what} integration by gfdtd @{time.ctime()}\n")
-            fh.write(f"% start-coordinates: ({','.join(f'{v * u:g}' for v in lo)}) m -> [{','.join(map(str, s))}]\n")
-            fh.write(f"% stop-coordinates: ({','.join(f'{v * u:g}' for v in hi)}) m -> [{','.join(map(str, e))}]\n")
-            fh.write(f"% t/s\t{what}\n")
-            out.append(fh)
-        return out
-
     def run(self, path, nr_ts, end_crit, verbose=1, out=print):
         """Run up to nr_ts timesteps in folder `path` (probe files written there), ending when the energy (the
         field's and the lumped branches', backend.energy) falls below end_crit times its peak after the excitation. Returns dict(steps, seconds, reason, db)."""
@@ -693,7 +663,15 @@ class Engine:
         with open(os.path.join(path, 'et'), 'w') as fh:
             fh.write("% time-domain excitation signal by gfdtd\n% t/s\tvoltage\n")
             fh.writelines(f"{n * dt:.12g}\t{v:.12g}\n" for n, v in enumerate(sig))
-        files = self._open_probes(path)
+        files = []
+        for p in be.order:                                          # the probe files, with openEMS's headers
+            fh = open(os.path.join(path, p['name']), 'w')
+            files.append(fh)
+            what, u = 'voltage' if p['field'] == 'V' else 'current', p['unit']
+            fh.write(f"% time-domain {what} integration by gfdtd @{time.ctime()}\n")
+            for end, (xyz, ijk) in (('start', p['start']), ('stop', p['stop'])):
+                fh.write(f"% {end}-coordinates: ({','.join(f'{v * u:g}' for v in xyz)}) m -> [{','.join(map(str, ijk))}]\n")
+            fh.write(f"% t/s\t{what}\n")
         dumps = Dumps(op, be, path, op.notes)
         pending = []                                                # (step, slot) samples in the device buffer
 

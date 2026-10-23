@@ -23,6 +23,8 @@ and vi: unconditionally stable, for any tau. PML_n: the n outermost cells of a s
 (CPML, kappa 1, no alpha) with a cubic conductivity grading, ending in PEC. Dumps: DumpBox regions at the cell
 centres (openEMS's dump mode 2), worked out by the engine.
 """
+from collections import defaultdict
+
 import numpy as np
 
 from . import csx as C
@@ -43,14 +45,6 @@ def _snap(lines, v):
     return float(lines[int(np.argmin(np.abs(lines - v)))])
 
 
-def _dual(d):
-    """Dual edge lengths at the N nodes from the N-1 primary lengths (half cells at the ends)."""
-    out = np.zeros(len(d) + 1)
-    out[:-1] += d / 2
-    out[1:] += d / 2
-    return out
-
-
 def _flat(shape, a, i, j, k):
     return ((a * shape[0] + i) * shape[1] + j) * shape[2] + k
 
@@ -65,7 +59,7 @@ class Grid:
         self.unit = g.delta_unit
         self.m = [l * self.unit for l in self.lines]
         self.d = [np.diff(l) for l in self.m]
-        self.dual = [_dual(d) for d in self.d]
+        self.dual = [np.r_[d / 2, 0] + np.r_[0, d / 2] for d in self.d]   # at the nodes: half cells at the ends
         self.shape = tuple(len(l) for l in self.lines)
         self.mid = [0.5 * (l[1:] + l[:-1]) for l in self.lines]        # cell centres, drawing units
         self.tol = [1e-6 * max(np.min(np.diff(l)), 1e-12) for l in self.lines]
@@ -74,27 +68,17 @@ class Grid:
         """Coordinates (drawing units) of the midpoints of the a-edges: three 1-D arrays."""
         return [self.mid[b] if b == a else self.lines[b] for b in range(3)]
 
-    def cell_points(self):
-        return list(self.mid)
-
 
 # ---- primitives: which points of a tensor grid are inside ------------------------------------------------------
 def _range_mask(coord, lo, hi, tol):
     return (coord >= lo - tol) & (coord <= hi + tol)
 
 
-def _poly_shape(q):
-    from shapely.geometry import Polygon
-    p = Polygon(np.asarray(q.points).T)
-    return p if p.is_valid else p.buffer(0)
-
-
 def inside(q, pts, grid, flat_snap=True):
     """Boolean mask (len X, len Y, len Z) of the tensor-grid points pts = [X, Y, Z] inside primitive q (boundary
     included). Flat primitives sit on their nearest mesh line (flat_snap)."""
     import shapely
-    X, Y, Z = pts
-    shape = (len(X), len(Y), len(Z))
+    shape = tuple(len(x) for x in pts)
     if isinstance(q, C.Polygon):                                    # Polygon / LinPoly, normal n
         n = q.norm_dir
         u, v = [b for b in range(3) if b != n]
@@ -103,7 +87,8 @@ def inside(q, pts, grid, flat_snap=True):
         else:
             lo = hi = _snap(grid.lines[n], q.elevation) if flat_snap else q.elevation
         mn = _range_mask(pts[n], lo, hi, grid.tol[n])
-        poly = _poly_shape(q)
+        poly = shapely.Polygon(np.asarray(q.points).T)
+        poly = poly if poly.is_valid else poly.buffer(0)
         x0, y0, x1, y1 = poly.bounds
         mu = _range_mask(pts[u], x0, x1, grid.tol[u])
         mv = _range_mask(pts[v], y0, y1, grid.tol[v])
@@ -115,7 +100,7 @@ def inside(q, pts, grid, flat_snap=True):
         inp = shapely.intersects_xy(poly, U.ravel(), V.ravel()).reshape(U.shape)
         plane = np.zeros((shape[u], shape[v]), bool)
         plane[np.ix_(iu, iv)] = inp
-        return _along(plane, mn, n, shape)
+        return np.broadcast_to(np.expand_dims(plane, n), shape) & mn.reshape([-1 if b == n else 1 for b in range(3)])
     if isinstance(q, C.Box):
         m = []
         for a in range(3):
@@ -210,23 +195,13 @@ def find_path(grid, p1, p2):
 
 def curve_edges(q, grid):
     """find_path over each segment of a Curve primitive."""
-    out = []
-    for P0, P1 in zip(q.points[:-1], q.points[1:]):
-        out += find_path(grid, P0, P1)
-    return out
+    return [e for P0, P1 in zip(q.points[:-1], q.points[1:]) for e in find_path(grid, P0, P1)]
 
 
 def edge_mask(q, a, grid):
     """inside() for the midpoints of the a-edges, on the (Nx, Ny, Nz) node array (False past the last edge)."""
     m = inside(q, grid.edge_points(a), grid)
     return np.pad(m, [(0, 1) if b == a else (0, 0) for b in range(3)])
-
-
-def _along(plane, mn, n, shape):
-    """plane (the two axes other than n) x mask mn along n -> a full (X, Y, Z) mask."""
-    full = np.expand_dims(plane, n)
-    line = mn.reshape([-1 if b == n else 1 for b in range(3)])
-    return np.broadcast_to(full, shape) & line
 
 
 # ---- the operator -------------------------------------------------------------------------------------------------
@@ -324,12 +299,11 @@ def build(csx, fdtd, log=None):
     owner = np.full(ncell, -1, np.int32)                            # the Debye material of each cell (index)
     props = [p for p in csx.GetAllProperties() if getattr(p, 'enabled', True)]
     debye = [p for p in props if isinstance(p, C.DebyeMaterial) and p.pole_list()]
-    cells = grid.cell_points()
     mats = [(q.priority, p, q) for p in props if isinstance(p, C.Material) for q in p.primitives]
     for pr, p, q in sorted(mats, key=lambda t: t[0]):
         if isinstance(q, C.Polygon) and not isinstance(q, C.LinPoly):
             continue                                                # flat: no cell volume
-        m = inside(q, cells, grid) & (pr >= prio)
+        m = inside(q, grid.mid, grid) & (pr >= prio)
         eps[m], kap[m], prio[m] = p.epsilon, p.kappa, pr
         owner[m] = debye.index(p) if p in debye else -1
         if getattr(p, 'mue', 1.0) != 1.0 and not getattr(op, '_mue_noted', False):
@@ -337,9 +311,7 @@ def build(csx, fdtd, log=None):
             op._mue_noted = True
     lE, aE, lH, aH = _geometry(grid)
     with np.errstate(divide='ignore', invalid='ignore'):
-        cap = np.zeros((3,) + sh)
-        cond = np.zeros((3,) + sh)
-        epsE = np.zeros((3,) + sh)
+        cap, cond, epsE = (np.zeros((3,) + sh) for _ in range(3))
         for a in range(3):
             epsE[a] = _edge_average(eps, a, grid)
             cap[a] = np.where(lE[a] > 0, EPS0 * epsE[a] * aE[a] / lE[a], 0.0)
@@ -441,8 +413,7 @@ def build(csx, fdtd, log=None):
         iv = np.where(aH > 0, dt * lH / (MU0 * aH), 0.0)
     vv[pec_m], vi[pec_m] = 0.0, 0.0
     # boundaries
-    bc = [str(b).upper() for b in fdtd['bc']]
-    op.bc = bc
+    op.bc = bc = [str(b).upper() for b in fdtd['bc']]
     mur0, mur1, murk = [], [], []
     op.pml = []
     for side, b in enumerate(bc):
@@ -463,8 +434,7 @@ def build(csx, fdtd, log=None):
             elif b == 'MUR':
                 ok = vi[t][tuple(sl)] > 0
                 pos = np.nonzero(ok)
-                ijk0 = [None] * 3
-                ijk1 = [None] * 3
+                ijk0, ijk1 = [None] * 3, [None] * 3
                 rest = [x for x in range(3) if x != a]
                 ijk0[a], ijk1[a] = np.full(len(pos[0]), face), np.full(len(pos[0]), inner)
                 for r_, pp in zip(rest, pos):
@@ -482,17 +452,9 @@ def build(csx, fdtd, log=None):
     # excitations: E (types 0 soft, 1 hard) on the edges, H (2 soft, 3 hard) on the dual edges, weighted, delayed
     op.exc, op.exc_more = _excitations(props, grid, sh, vv, vi, lE, lH, dt, op.notes)
     # probes
-    op.probes = []
-    for p in props:
-        if isinstance(p, C.ProbeBox):
-            for q in p.primitives[:1]:
-                pr = _probe(p, q, grid, sh)
-                if pr is not None:
-                    op.probes.append(pr)
-    op.dumps = []
-    for p in props:
-        if isinstance(p, C.DumpBox) and p.primitives:
-            op.dumps += _dump(p, grid, op.notes)
+    op.probes = [pr for p in props if isinstance(p, C.ProbeBox) and p.primitives
+                 if (pr := _probe(p, p.primitives[0], grid, sh)) is not None]
+    op.dumps = [d for p in props if isinstance(p, C.DumpBox) and p.primitives for d in _dump(p, grid, op.notes)]
     if op.dumps:                                                    # the geometry the dumps need, kept
         op.lE, op.aE, op.lH = lE, aE, lH
         if any(d['field'] == 'Jc' for d in op.dumps):
@@ -508,8 +470,7 @@ def build(csx, fdtd, log=None):
     op.signal = gauss(t)
     op.signal_h = gauss(t + dt / 2)                                # the H excitations' signal: half a step later
     op.delay_max = max([g['delay'] for g in op.exc_more], default=0)
-    nyq = max(1, int(1.0 / (2 * (f0 + fc) * dt)))
-    op.nyquist = nyq
+    op.nyquist = nyq = max(1, int(1.0 / (2 * (f0 + fc) * dt)))
     op.sub = max(1, nyq // int(fdtd.get('oversampling', 4) or 4))
     if log:
         for line in describe(op):
@@ -755,7 +716,7 @@ def _probe(p, q, grid, sh):
     """dict(name, type, field 'V' | 'I', idx, w, start, stop) of a probe box: the terms whose sum is its value."""
     s = [int(np.argmin(np.abs(grid.lines[a] - q.start[a]))) for a in range(3)]
     e = [int(np.argmin(np.abs(grid.lines[a] - q.stop[a]))) for a in range(3)]
-    terms = {}
+    terms = defaultdict(float)
     if p.p_type == 0:                                               # E integral, x then y then z
         pos = list(s)
         for a in range(3):
@@ -764,8 +725,7 @@ def _probe(p, q, grid, sh):
                 i = pos[a] if step > 0 else pos[a] - 1
                 idx = list(pos)
                 idx[a] = i
-                f = _flat(sh, a, *idx)
-                terms[f] = terms.get(f, 0.0) + step * p.weight
+                terms[_flat(sh, a, *idx)] += step * p.weight
                 pos[a] += step
         field = 'V'
     elif p.p_type == 1:                                             # H loop around the box, normal n
@@ -788,8 +748,7 @@ def _probe(p, q, grid, sh):
                         jdx[off] -= shift
                         if jdx[off] < 0:
                             continue
-                        f = _flat(sh, comp, *jdx)
-                        terms[f] = terms.get(f, 0.0) + sgn * s2 * p.weight
+                        terms[_flat(sh, comp, *jdx)] += sgn * s2 * p.weight
         field = 'I'
     elif p.p_type in (10, 11):
         terms = _mode_match(p, grid, sh, s, e)
@@ -840,11 +799,10 @@ def _mode_match(p, grid, sh, s, e):
     if norm == 0:
         return None
     fu, fv = fu / norm, fv / norm
-    terms = {}
+    terms = defaultdict(float)
 
     def add(comp, ijk, w):
-        f = _flat(sh, comp, *ijk)
-        terms[f] = terms.get(f, 0.0) + w * p.weight
+        terms[_flat(sh, comp, *ijk)] += w * p.weight
 
     for x, i in enumerate(iu):
         for y, j in enumerate(iv):
