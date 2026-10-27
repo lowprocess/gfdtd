@@ -28,10 +28,19 @@ core = ["pybind11>=2.10"]          # python -m gfdtd.core.build: the compiled CP
 gpu-cuda12 = ["cupy-cuda12x>=14"]   # NVIDIA, CUDA 12.x driver
 gpu-cuda13 = ["cupy-cuda13x>=14"]   # NVIDIA, CUDA 13.x driver
 gpu-rocm7 = ["cupy-rocm-7-0>=14"]   # AMD, ROCm 7.0
+kicad2ems = ["kicad2ems>=261027"]  # the kicad2ems solver plugin (gfdtd.kicad2ems); kicad2ems installs gfdtd
+                                   # through its own gfdtd extra
 test = ["pytest>=7"]
 
 [project.scripts]
 gfdtd = "gfdtd.fdtd:main"           # run an openEMS XML file, as `openEMS model.xml`
+
+# kicad2ems finds its solvers and FDTD engines through these groups (gfdtd.kicad2ems)
+[project.entry-points."kicad2ems.solvers"]
+gfdtd = "gfdtd.kicad2ems:GFDTD"
+
+[project.entry-points."kicad2ems.engines"]
+gfdtd = "gfdtd.kicad2ems"
 
 [tool.setuptools.dynamic]
 version = {attr = "gfdtd.__version__"}

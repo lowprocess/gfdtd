@@ -279,6 +279,8 @@ gfdtd/
   nf2ff.py      the far field: openEMS's NF2FF box, CalcNF2FF and its result file
   kernels.py    the GPU kernels around core/fdtd_core.h
   core/         fdtd_core.h (the update code, GPU and CPU), gfdtd_core.cpp (the CPU core), build.py
+  kicad2ems.py  kicad2ems's solver plugin and FDTD engine, gfdtd (the kicad2ems.solvers / kicad2ems.engines entry
+                points; only kicad2ems imports it)
 tests/test_gfdtd.py          compatibility, operator, physics on small models, the far field, GPU and core
                              against numpy
 tests/test_gfdtd_ports.py    the ports, weighted / hard / H / delayed excitations, mode matching, shells,

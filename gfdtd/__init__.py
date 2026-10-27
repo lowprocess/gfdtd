@@ -19,7 +19,7 @@ energy end criterion; ABORT files.
     engine.py    the time loop, the numpy and CuPy backends, status lines and probe files
     kernels.py   the GPU kernels
 """
-__version__ = '261020-r1'
+__version__ = '261027-r1'
 
 from .csx import ContinuousStructure                                # noqa: E402,F401
 from .fdtd import openEMS, LumpedPort                               # noqa: E402,F401
