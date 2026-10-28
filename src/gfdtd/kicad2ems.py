@@ -6,7 +6,7 @@ ports, the parts and the end criteria are the FDTD settings shared with openEMS;
 to <out>/gfdtd/exc_<port>, the CSX file to <name>_gfdtd.xml (also runnable with `python -m gfdtd`), the antenna
 results to <name>_gfdtd_antenna.json.
 
-Not yet: the --converge levels, conductor loss (conducting sheets are PEC), phased drives (--drive).
+Not yet: the --converge levels, conductor loss (conducting sheets are PEC).
 """
 import os
 
@@ -31,7 +31,7 @@ class GFDTD(FDTD):
     capabilities = dict(FDTD.capabilities,
                         conductor_loss='ignored: copper is PEC (conducting sheets as PEC)',
                         dispersion='yes: fitted at mid-band, or wideband Debye',
-                        antenna='yes: one driven port (no phased drive)')
+                        antenna='yes (a phased drive: a run per driven port)')
     options = MESH + RUN + [
         Option('gfdtd_backend', 'auto', "gfdtd: where it runs - auto (the GPU when CuPy finds one, else the CPU), gpu "
                "(CuPy: CUDA or ROCm) or cpu (the compiled core: python -m gfdtd.core.build; else numpy, slow); its "
@@ -74,7 +74,7 @@ class GFDTD(FDTD):
             return []
         s = run.s
         return [f"{what}: openEMS's" for what, on in (("--sigma (gfdtd's copper is PEC)", s.sigma),
-                                                    ("--converge", getattr(s, "converge", None)), ("--drive", s.drive)) if on]
+                                                    ("--converge", getattr(s, "converge", None))) if on]
 
     def estimate(self, run):
         """openEMS's estimate (the same mesh and timesteps), at gfdtd's speed on the backend it would use."""

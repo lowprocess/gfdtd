@@ -71,8 +71,8 @@ Stop and S-parameter code among them) work on gfdtd unchanged.
 | Far field | openEMS's NF2FF box (`CreateNF2FFBox`, `CalcNF2FF`), frequency domain, PEC / PMC mirrors: antenna mode |
 | End | the energy in the field and in the lumped parts (`EndCriteria`), timestep limit, `ABORT` |
 
-Not yet: conductor loss (`--sigma`: conducting sheets run as PEC), Lorentz materials, phased drives in antenna
-mode (`--drive`: the first port alone), time-domain NF2FF, `--converge`, the mode-purity column of
+Not yet: conductor loss (`--sigma`: conducting sheets run as PEC), Lorentz materials, time-domain NF2FF,
+`--converge`, the mode-purity column of
 mode-matching probes, field probes (types 2, 3), and cylindrical grids. A file that holds these is still read:
 what gfdtd doesn't model is listed as a note.
 
