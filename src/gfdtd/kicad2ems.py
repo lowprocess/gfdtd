@@ -10,8 +10,8 @@ Not yet: the --converge levels, conductor loss (conducting sheets are PEC), phas
 """
 import os
 
-from kicad2ems.solvers import Option, AUTO
-from kicad2ems.fdtd.plugin import FDTD, MESH, RUN
+from kicad2ems.api.solver import Option, AUTO
+from kicad2ems.api.solver import FDTD, MESH, RUN
 
 G = 'gfdtd'                                     # its section in kicad2ems's GUI
 # gfdtd's speed over openEMS's estimate (24 threads), per backend: the examples' runs on an RX 7800 XT and an
@@ -21,6 +21,7 @@ SPEEDUP, START = dict(cupy=8.0, core=2.0, numpy=0.1), 2.0
 
 
 class GFDTD(FDTD):
+    api = (1, 0)                    # kicad2ems.api
     name, aliases, label = 'gfdtd', ('gpu-fdtd',), 'gfdtd (GPU FDTD)'
     in_auto = True                  # auto: picked over openEMS where it can (no --sigma, --converge, --drive)
     in_all = False                  # --solvers all: openEMS's model again, named on its own
@@ -48,6 +49,14 @@ class GFDTD(FDTD):
         core, cwhat = core_info()
         return True, f"CPU: {cwhat if core else 'numpy (slow; build the core: python -m gfdtd.core.build)'}" + (
             '' if gpu else f"; {what}")
+
+    def resources(self):
+        """The GPU gfdtd's engine would run on (CuPy's first device), or why there is none."""
+        from emdev import gpu
+        try:
+            return dict(gpus=[gpu.cupy_device(0).as_dict()], why='')
+        except gpu.Unavailable as e:
+            return dict(gpus=[], why=str(e))
 
     def details(self):
         ok, what = self.check()

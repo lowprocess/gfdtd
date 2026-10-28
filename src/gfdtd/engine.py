@@ -14,6 +14,8 @@ A file ABORT in the run folder ends the run as with openEMS (kicad2ems's port wa
 import os, time
 
 import numpy as np
+from emdev import gpu as devices                                    # the GPU's probe, shared with mom25d
+from emdev.cpu import core_threads                                  # noqa: F401  (gfdtd.engine.core_threads)
 
 from . import kernels
 from .dumps import Dumps
@@ -27,17 +29,9 @@ CHUNK = 512             # probe samples kept on the device before they are writt
 def gpu_info():
     """(usable, one line): is there a CuPy and a GPU it can run on?"""
     try:
-        import cupy
-        n = cupy.cuda.runtime.getDeviceCount()
-        if n < 1:
-            return False, 'CuPy finds no GPU'
-        props = cupy.cuda.runtime.getDeviceProperties(0)
-        name = props.get('name', b'GPU')
-        name = name.decode() if isinstance(name, bytes) else str(name)
-        rt = 'ROCm' if getattr(cupy.cuda.runtime, 'is_hip', False) else 'CUDA'
-        return True, f"{name} ({rt}, CuPy {cupy.__version__}, {props.get('totalGlobalMem', 0) / 2 ** 30:.0f} GB)"
-    except Exception as e:                                          # no CuPy, no driver, a broken install
-        return False, f"no GPU: {type(e).__name__}: {e}"
+        return True, devices.cupy_device(0).describe()
+    except devices.Unavailable as e:                                # no CuPy, no driver, a broken install
+        return False, f"no GPU: {e}"
 
 
 def core_info():
@@ -48,32 +42,6 @@ def core_info():
         return True, f"compiled CPU core, {n} threads"
     except ImportError as e:
         return False, f"no compiled CPU core (python -m gfdtd.core.build): {e}"
-
-
-def core_threads():
-    """The CPU core's default thread count: one per physical core of the fastest kind (the performance cores of a
-    hybrid CPU; no hyper-threads). On an i7-13700K (8 P + 8 E cores, 24 threads) 8 threads ran 1.2-3x faster
-    than 24: the barriers wait for the slowest thread. OMP_NUM_THREADS (or numThreads) overrides it."""
-    base = '/sys/devices/system/cpu'
-    try:
-        cpus = sorted(os.sched_getaffinity(0))
-    except AttributeError:                                          # not Linux
-        return max(1, (os.cpu_count() or 2) // 2)
-    info = {}
-    for c in cpus:
-        rd = lambda f: open(f"{base}/cpu{c}/{f}").read().strip()
-        try:
-            fmax = int(rd('cpufreq/cpuinfo_max_freq'))
-        except (OSError, ValueError):
-            fmax = 0
-        try:
-            core = (rd('topology/physical_package_id'), rd('topology/core_id'))
-        except OSError:
-            core = ('0', str(c))
-        info[c] = (fmax, core)
-    top = max(f for f, _ in info.values())
-    fast = {core for f, core in info.values() if f >= 0.95 * top}
-    return max(1, len(fast))
 
 
 def concurrent_runs(cells, runs):
@@ -88,9 +56,7 @@ def concurrent_runs(cells, runs):
 def resolve_backend(name='auto'):
     """'cupy', 'core' or 'numpy' for a backend name: auto (the GPU, else the core, else numpy), gpu / cupy, cpu (the
     core, else numpy), core, numpy. GFDTD_BACKEND overrides it."""
-    name = (os.environ.get('GFDTD_BACKEND') or name or 'auto').lower()
-    if name in ('gpu', 'cuda', 'rocm', 'hip'):
-        name = 'cupy'
+    name = devices.preference(name, 'GFDTD_BACKEND', dict.fromkeys(('gpu', 'cuda', 'rocm', 'hip'), 'cupy'))
     if name in ('cpu', 'auto'):
         name = 'cupy' if name == 'auto' and gpu_info()[0] else ('core' if core_info()[0] else 'numpy')
     if name not in ('cupy', 'core', 'numpy'):
