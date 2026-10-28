@@ -28,7 +28,7 @@ kicad2ems's models here): a minor release adds to it, a major one removes or cha
     engine.concurrent_runs(cells, runs)          how many runs to have on the GPU at once
     __version__
 """
-__version__ = '261028'
+__version__ = '261028-r1'
 API_VERSION = (1, 0)
 
 from .csx import ContinuousStructure                                # noqa: E402,F401
