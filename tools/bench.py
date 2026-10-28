@@ -10,7 +10,7 @@ times each operation run on its own (the GPU: events around each kernel, which a
 """
 import argparse, contextlib, io, os, sys, time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 import numpy as np
 
 from gfdtd import ContinuousStructure, openEMS

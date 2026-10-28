@@ -16,7 +16,7 @@ gfdtd`), which builds openEMS's model of a board and runs it here.
 pip install .                       # numpy, scipy, shapely, h5py
 pip install '.[gpu-rocm7]'          # the GPU: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
 pip install '.[core]'               # pybind11, then build the CPU core (g++ with OpenMP):
-python -m gfdtd.core.build          # gfdtd/_core*.so; GFDTD_ARCH=-march=x86-64-v3 for a portable build
+python -m gfdtd.core.build          # src/gfdtd/_core*.so; GFDTD_ARCH=-march=x86-64-v3 for a portable build
 ```
 
 The CuPy extras conflict: install one. The CUDA wheels need the NVIDIA driver; the ROCm wheel the ROCm 7 runtime.
@@ -116,7 +116,7 @@ negated, |S11| near 95 for a lumped port along y); x and z were right, which is 
 
 ## How it works
 
-The operator (`gfdtd/operator.py`) uses openEMS's formulation. Fields are kept as edge voltages (V = E dl)
+The operator (`src/gfdtd/operator.py`) uses openEMS's formulation. Fields are kept as edge voltages (V = E dl)
 and currents (I = H dl′), so the update needs only three coefficient arrays per field component and no
 geometry at run time:
 
@@ -139,7 +139,7 @@ V   = vv * V + vi * (loop sum of I around the dual face)  from C = eps A' / l, G
 - **Dumps** are at the cell centres, on the cells openEMS's dump mode 2 picks (the box snapped to lines s0..s1,
   then the cells s0-1..s1), or at the nodes (modes 0, 1), sampled with the probes. The frequency domain is a
   running DFT on the device: 2 dt_s sum F(t) exp(-j w t), as openEMS's.
-- **Far field** (`gfdtd/nf2ff.py`): the NF2FF box records E and H at the nodes of its six faces (as openEMS's,
+- **Far field** (`src/gfdtd/nf2ff.py`): the NF2FF box records E and H at the nodes of its six faces (as openEMS's,
   inside a Mur side's 2 lines or a PML_n side's n + 1; no face on a PEC / PMC side, which mirrors instead). The
   faces carry J = n x H and M = -n x E. On a planar face the phase e^(jk r.r') is a product over its two axes,
   so the radiation integrals are matrix products. Prad is the flux through the faces, 1/2 Re sum (E x H*).n,
@@ -148,8 +148,8 @@ V   = vv * V + vi * (loop sum of I around the dual face)  from C = eps A' / l, G
 - **Time step:** the stability limit of the rectilinear grid (the shortest neighbouring cells around each
   node), times 0.95. That is about 10 % shorter than openEMS's Rennings step.
 
-The engine (`gfdtd/engine.py`) is a Python time loop over one backend. The GPU and the CPU core run the same
-update code (`gfdtd/core/fdtd_core.h`) on the **compressed operator**:
+The engine (`src/gfdtd/engine.py`) is a Python time loop over one backend. The GPU and the CPU core run the same
+update code (`src/gfdtd/core/fdtd_core.h`) on the **compressed operator**:
 
 - There are no coefficient arrays. iv is pure geometry, dt dual_a / (mu d_b d_c), from three line arrays. vi is
   that geometry times a per-edge factor s. vv and s come from a table through one code per node, covering its
@@ -162,7 +162,7 @@ update code (`gfdtd/core/fdtd_core.h`) on the **compressed operator**:
 
 The three backends:
 
-- **CuPy** (`gfdtd/kernels.py`): one thread per node, in blocks of 128. The same source compiles for ROCm
+- **CuPy** (`src/gfdtd/kernels.py`): one thread per node, in blocks of 128. The same source compiles for ROCm
   through hiprtc. Fields are float32. A timestep is three launches:
   - `step_h`: H, the node's PML terms and the Mur copies.
   - `step_e`: E with the Debye poles and the node's PML terms.
@@ -176,7 +176,7 @@ The three backends:
   that interpolates and adds the DFT term. Probe samples stay on the device. Excitations run in threads, each on
   its own stream, as many at once as fit in the GPU's cache together (`concurrent_runs`: up to 1.2 M cells in
   all; `--jobs` or `GFDTD_CONCURRENT_CELLS` set it).
-- **core** (`gfdtd/core/gfdtd_core.cpp`, pybind11 and OpenMP): rows along z with the boundary tests outside the
+- **core** (`src/gfdtd/core/gfdtd_core.cpp`, pybind11 and OpenMP): rows along z with the boundary tests outside the
   loops, so that the compiler vectorises them; Mur and PML too. Denormals are flushed to zero while it runs
   (the GPU does this anyway). Before that, the tiny fields ahead of the first wave ran the first few thousand
   steps 5–10 times slower. It runs one thread per physical core of the fastest kind: the performance cores of
@@ -269,7 +269,7 @@ Tried and left out:
 ## Files
 
 ```
-gfdtd/
+src/gfdtd/
   csx.py        CSXCAD's structure: grid, properties, primitives; its XML both ways
   fdtd.py       openEMS's interface: settings, LumpedPort, the Add...Port methods, Run, the XML; the command line
   ports.py      openEMS's other ports: MSL, stripline, CPW, coaxial, waveguides, curve
@@ -286,5 +286,7 @@ tests/test_gfdtd.py          compatibility, operator, physics on small models, t
 tests/test_gfdtd_ports.py    the ports, weighted / hard / H / delayed excitations, mode matching, shells,
                              curves, current-probe snapping
 tests/openems_files.py       readers of the openEMS files a run writes, for the tests
+tests/test_kicad2ems.py      the kicad2ems plugin: registered, its engine, kicad2ems's model built through it (needs
+                             a kicad2ems checkout, ../kicad2ems or KICAD2EMS_SRC; left out without one)
 tools/bench.py               the engine's per-operation timings by backend and model size
 ```

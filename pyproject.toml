@@ -46,6 +46,7 @@ gfdtd = "gfdtd.kicad2ems"
 version = {attr = "gfdtd.__version__"}
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["gfdtd*"]
 
 [tool.setuptools.package-data]
