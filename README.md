@@ -10,7 +10,8 @@ CPU, about twice as fast, and five times with PML and wideband dielectrics (see 
 as a solver for [kicad2ems](https://github.com/lowprocess/kicad2ems) (KiCad boards to S-parameters, `--solvers
 gfdtd`), which builds openEMS's model of a board and runs it here. The connection lives in
 [kicad2ems-fdtd](https://github.com/lowprocess/kicad2ems-fdtd), with openEMS's; gfdtd itself knows nothing of
-kicad2ems.
+kicad2ems. What kicad2ems-fdtd may rely on is versioned: `gfdtd.API_VERSION` (its docstring lists it), checked
+there.
 
 ## Install
 

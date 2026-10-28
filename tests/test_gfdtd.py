@@ -593,3 +593,15 @@ def test_command_line_runs_an_xml(tmp_path, capsys):
     out = capsys.readouterr().out
     assert 'note: RotPoly odd' in out and 'Timestep' in out
     assert os.path.exists(tmp_path / 'run' / 'port_ut_1')
+
+
+def test_api_version_and_its_names():
+    """API_VERSION names what other packages may use (kicad2ems-fdtd): each of those is here."""
+    import inspect
+    import gfdtd
+    from gfdtd import engine
+    assert gfdtd.API_VERSION == (1, 0)
+    assert 'backend' in inspect.signature(gfdtd.openEMS).parameters and gfdtd.ContinuousStructure
+    for name, args in (('gpu_info', []), ('core_info', []), ('resolve_backend', ['name']),
+                       ('concurrent_runs', ['cells', 'runs'])):
+        assert list(inspect.signature(getattr(engine, name)).parameters) == args, name

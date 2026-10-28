@@ -18,8 +18,18 @@ energy end criterion; ABORT files.
     operator.py  the model on the grid: coefficients, lumped elements, excitations, boundaries, probes
     engine.py    the time loop, the numpy and CuPy backends, status lines and probe files
     kernels.py   the GPU kernels
+
+API_VERSION is (major, minor), the version of what another package may rely on (kicad2ems-fdtd, which runs
+kicad2ems's models here): a minor release adds to it, a major one removes or changes something in it.
+
+    ContinuousStructure, openEMS(..., backend=)   openEMS's / CSXCAD's Python interface, as openEMS scripts use it
+    engine.gpu_info(), engine.core_info()        (usable, one line) of the GPU and the compiled CPU core
+    engine.resolve_backend(name)                 'cupy', 'core' or 'numpy' for 'auto', 'gpu', 'cpu', ...
+    engine.concurrent_runs(cells, runs)          how many runs to have on the GPU at once
+    __version__
 """
-__version__ = '261027-r1'
+__version__ = '261028'
+API_VERSION = (1, 0)
 
 from .csx import ContinuousStructure                                # noqa: E402,F401
 from .fdtd import openEMS, LumpedPort                               # noqa: E402,F401
