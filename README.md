@@ -8,7 +8,9 @@ XML file as `openEMS model.xml` does. Neither openEMS nor CSXCAD needs to be ins
 On one mid-range GPU gfdtd runs 8–20 times faster than openEMS on a 24-thread CPU; its CPU core, on that same
 CPU, about twice as fast, and five times with PML and wideband dielectrics (see [Speed](#speed)). It was written
 as a solver for [kicad2ems](https://github.com/lowprocess/kicad2ems) (KiCad boards to S-parameters, `--solvers
-gfdtd`), which builds openEMS's model of a board and runs it here.
+gfdtd`), which builds openEMS's model of a board and runs it here. The connection lives in
+[kicad2ems-fdtd](https://github.com/lowprocess/kicad2ems-fdtd), with openEMS's; gfdtd itself knows nothing of
+kicad2ems.
 
 ## Install
 
@@ -279,14 +281,10 @@ src/gfdtd/
   nf2ff.py      the far field: openEMS's NF2FF box, CalcNF2FF and its result file
   kernels.py    the GPU kernels around core/fdtd_core.h
   core/         fdtd_core.h (the update code, GPU and CPU), gfdtd_core.cpp (the CPU core), build.py
-  kicad2ems.py  kicad2ems's solver plugin and FDTD engine, gfdtd (the kicad2ems.solvers / kicad2ems.engines entry
-                points; only kicad2ems imports it)
 tests/test_gfdtd.py          compatibility, operator, physics on small models, the far field, GPU and core
                              against numpy
 tests/test_gfdtd_ports.py    the ports, weighted / hard / H / delayed excitations, mode matching, shells,
                              curves, current-probe snapping
 tests/openems_files.py       readers of the openEMS files a run writes, for the tests
-tests/test_kicad2ems.py      the kicad2ems plugin: registered, its engine, kicad2ems's model built through it (needs
-                             a kicad2ems checkout, ../kicad2ems or KICAD2EMS_SRC; left out without one)
 tools/bench.py               the engine's per-operation timings by backend and model size
 ```
