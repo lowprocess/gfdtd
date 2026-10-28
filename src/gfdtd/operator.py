@@ -29,7 +29,7 @@ import numpy as np
 
 from . import csx as C
 
-EPS0, MU0, C0 = 8.8541878128e-12, 1.25663706212e-6, 299792458.0
+from .constants import EPS0, MU0, C0
 SAFETY = 0.95           # time step: this fraction of the stability limit (C0, the shortest neighbouring cells)
 PML_GRADING = 3         # PML conductivity ~ depth^m
 PML_R0 = 1e-6           # PML: the reflection of a normal wave through it and back, in theory

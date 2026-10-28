@@ -19,10 +19,7 @@ import numpy as np
 
 from . import csx as C
 
-C0 = 299792458.0
-MUE0 = 4e-7 * np.pi
-EPS0 = 1 / (MUE0 * C0 ** 2)
-Z0 = np.sqrt(MUE0 / EPS0)
+from .constants import C0, EPS0, MU0 as MUE0, ETA0 as Z0         # noqa: F401  (openEMS's names)
 
 
 def _load_ui_file(path):

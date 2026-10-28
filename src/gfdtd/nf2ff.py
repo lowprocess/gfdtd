@@ -23,8 +23,7 @@ import os
 
 import numpy as np
 
-C0, MU0 = 299792458.0, 1.25663706212e-6
-ETA0 = MU0 * C0
+from .constants import C0, MU0, ETA0                              # noqa: F401
 
 
 class nf2ff:                                                         # noqa: N801  (openEMS's name)
