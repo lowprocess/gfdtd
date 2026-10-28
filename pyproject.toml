@@ -20,7 +20,7 @@ dependencies = [
     "scipy>=1.10",                 # Bessel functions of the circular waveguide modes
     "shapely>=2.0",
     "h5py>=3",                     # frequency-domain dumps, NF2FF results
-    "emsdev @ git+https://github.com/lowprocess/emsdev",   # the GPU probe and CPU threads (shared with mom25d)
+    "emsdev @ https://github.com/lowprocess/emsdev/archive/refs/heads/main.zip", # the GPU probe and CPU threads (shared with mom25d)
 ]
 
 [project.optional-dependencies]
