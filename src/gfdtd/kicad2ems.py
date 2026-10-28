@@ -52,7 +52,7 @@ class GFDTD(FDTD):
 
     def resources(self):
         """The GPU gfdtd's engine would run on (CuPy's first device), or why there is none."""
-        from emdev import gpu
+        from emsdev import gpu
         try:
             return dict(gpus=[gpu.cupy_device(0).as_dict()], why='')
         except gpu.Unavailable as e:

@@ -13,7 +13,7 @@ gfdtd`), which builds openEMS's model of a board and runs it here.
 ## Install
 
 ```bash
-pip install .                       # numpy, scipy, shapely, h5py, emdev (the GPU probe, CPU threads)
+pip install .                       # numpy, scipy, shapely, h5py, emsdev (the GPU probe, CPU threads)
 pip install '.[gpu-rocm7]'          # the GPU: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
 pip install '.[core]'               # pybind11, then build the CPU core (g++ with OpenMP):
 python -m gfdtd.core.build          # src/gfdtd/_core*.so; GFDTD_ARCH=-march=x86-64-v3 for a portable build

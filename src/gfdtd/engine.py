@@ -14,8 +14,8 @@ A file ABORT in the run folder ends the run as with openEMS (kicad2ems's port wa
 import os, time
 
 import numpy as np
-from emdev import gpu as devices                                    # the GPU's probe, shared with mom25d
-from emdev.cpu import core_threads                                  # noqa: F401  (gfdtd.engine.core_threads)
+from emsdev import gpu as devices                                    # the GPU's probe, shared with mom25d
+from emsdev.cpu import core_threads                                  # noqa: F401  (gfdtd.engine.core_threads)
 
 from . import kernels
 from .dumps import Dumps
