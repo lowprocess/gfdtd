@@ -176,8 +176,8 @@ class Box(Primitive):
 
 
 class Polygon(Primitive):
-    """A flat polygon at `elevation` normal to `norm_dir`; points = [coords of the first in-plane axis, of the
-    second] (in-plane axes in xyz order without norm_dir)."""
+    """A flat polygon at `elevation` normal to `norm_dir`; points = [X1s, X2s] in CSXCAD's vertex order: X1 along
+    (norm_dir + 1) % 3, X2 along (norm_dir + 2) % 3 (for norm_dir y: X1 is z, X2 is x)."""
     kind = 'Polygon'
 
     def __init__(self, prop, points, norm_dir, elevation, priority=0):

@@ -74,6 +74,13 @@ def _range_mask(coord, lo, hi, tol):
     return (coord >= lo - tol) & (coord <= hi + tol)
 
 
+def plane_points(q):
+    """A Polygon's / LinPoly's vertices as [coords along u, coords along v], u < v its in-plane axes. CSXCAD's vertex
+    order is cyclic (X1 along (n + 1) % 3, X2 along (n + 2) % 3): for a y normal X1 is z and X2 is x, so they swap."""
+    P = np.asarray(q.points)
+    return P[::-1] if q.norm_dir == 1 else P
+
+
 def inside(q, pts, grid, flat_snap=True):
     """Boolean mask (len X, len Y, len Z) of the tensor-grid points pts = [X, Y, Z] inside primitive q (boundary
     included). Flat primitives sit on their nearest mesh line (flat_snap)."""
@@ -87,7 +94,7 @@ def inside(q, pts, grid, flat_snap=True):
         else:
             lo = hi = _snap(grid.lines[n], q.elevation) if flat_snap else q.elevation
         mn = _range_mask(pts[n], lo, hi, grid.tol[n])
-        poly = shapely.Polygon(np.asarray(q.points).T)
+        poly = shapely.Polygon(plane_points(q).T)
         poly = poly if poly.is_valid else poly.buffer(0)
         x0, y0, x1, y1 = poly.bounds
         mu = _range_mask(pts[u], x0, x1, grid.tol[u])
