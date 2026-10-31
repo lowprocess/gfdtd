@@ -329,6 +329,17 @@ def build(csx, fdtd, log=None):
                 for a in range(3):
                     m = edge_mask(q, a, grid)
                     np.maximum(pec[a], np.where(m, q.priority, -np.inf), out=pec[a])
+    # a material of higher priority than every metal at an edge's midpoint takes the edge, as in openEMS (the property
+    # of the highest priority at the edge centre decides: CSXCAD's GetPropertyByCoordPriority; on a tie the property
+    # met first wins, here the metal). Without this a metal block with a drilled hole (a nut round a PTFE bore,
+    # priority above the metal's) stayed solid and shorted the feed.
+    for pr, p, q in mats:
+        if isinstance(q, C.Polygon) and not isinstance(q, C.LinPoly):
+            continue
+        for a in range(3):
+            cand = (pec[a] > -np.inf) & (pec[a] < pr)
+            if cand.any():
+                pec[a][cand & edge_mask(q, a, grid)] = -np.inf
     if any(isinstance(p, C.ConductingSheet) for p in props):
         op.notes.append("conducting sheets are modelled as PEC (no conductor loss)")
     # lumped elements: parallel R / C into G / C of the edges, parallel L and series RLC as edge branches
@@ -382,6 +393,7 @@ def build(csx, fdtd, log=None):
                             idx[a], idx[t], idx[u] = line, ti, ui
                             pec[t][tuple(idx)] = max(pec[t][tuple(idx)], pr)
     pec_m = pec > -np.inf
+    op.pec_mask = pec_m                                             # the PEC edges (3, Nx, Ny, Nz): connectivity checks
     op.n_pec = [int(pec_m[a].sum()) for a in range(3)]
     dt = op.dt
     # Debye poles: i' = ka i + kb (V' - V); the E update sees (i + i') / 2, so kb / 2 joins the edge's C / dt
