@@ -8,7 +8,7 @@ import pytest
 from gfdtd import ContinuousStructure, openEMS
 from gfdtd import csx as C
 from gfdtd.engine import gpu_info, core_info
-from gfdtd.operator import build, timestep, Grid
+from gfdtd.operator import build, timestep, inside, Grid
 
 from openems_files import read_fd, read_vtr, steps_taken
 
@@ -187,6 +187,82 @@ def test_operator_metal_edges_and_dielectric_average(tmp_path):
     assert len(op.exc[0]) == 4                                        # 2 columns (y = 2, 3) x 2 z edges
     assert sorted(p['name'] for p in op.probes) == ['port_it_1', 'port_ut_1']
     assert [(sl['axis'], sl['hi'], sl['n']) for sl in op.pml] == [(1, 0, 4)]   # ymin PML_8: 4 of the 5 cells
+
+
+@pytest.mark.parametrize('nd', [0, 1, 2])
+def test_polygon_vertices_in_csxcads_order(nd):
+    """CSXCAD's vertex order is cyclic, X1 along (normal + 1) % 3 and X2 along (normal + 2) % 3 (a y normal: X1 is z,
+    X2 is x), as its IsInside has it: a triangle 4 long in X1 and 1 in X2 reaches 3 along X1's axis, not along X2's."""
+    csx = ContinuousStructure()
+    for a in 'xyz':
+        csx.GetGrid().SetLines(a, np.arange(-1, 5.01, 0.5))
+    grid = Grid(csx.GetGrid())
+    q = csx.AddMetal('m').AddLinPoly([np.array([0., 4, 0]), np.array([0., 0, 1])], 'xyz'[nd], -0.5, 1.0)
+    x1, x2 = (nd + 1) % 3, (nd + 2) % 3
+    for along, across, hit in ((x1, x2, True), (x2, x1, False)):
+        pts = [np.array([0.0]) for _ in range(3)]
+        pts[along], pts[across] = np.array([3.0]), np.array([0.1])
+        assert inside(q, pts, grid)[0, 0, 0] == hit
+
+
+def _rotated_parts(csx):
+    """A disc revolved from a y-normal rectangle (X1 = z 1..2, X2 = x 0..3) about z, and a bar along x turned 90
+    degrees about z (CSXCAD's AddTransform takes degrees)"""
+    m = csx.AddMetal('m')
+    disc = m.AddRotPoly([np.array([1., 2, 2, 1]), np.array([0., 0, 3, 3])], 'y', 0.0, 'z', [0, 2 * np.pi])
+    bar = m.AddBox([0, -0.5, -0.5], [4, 0.5, 0.5])
+    bar.AddTransform('RotateAxis', 'z', 90)
+    return disc, bar
+
+
+# CSXCAD 0.7.0's IsInside on the same two parts: (point, inside)
+ROTATED_REF = (((0, 1.5, 1), (0, 1.5, 0)), ((1.5, 0, 1), (3, 0, 0)), ((0, 0.5, 1), (0, 3.5, 0.4)),
+               ((0, 1.5, -1), (0.6, 2, 0)), ((0, 1.5, 2.9), (0, -1, 0)), ((1, 1, 0.5), (0.2, 4.2, 0)))
+ROTATED_IN = ((True, True), (True, False), (True, True), (False, False), (False, False), (False, False))
+
+
+def test_rotpoly_and_rotations_as_csxcad_has_them():
+    csx = ContinuousStructure()
+    for a in 'xyz':
+        csx.GetGrid().SetLines(a, np.arange(-5, 5.01, 0.5))
+    grid = Grid(csx.GetGrid())
+    parts = _rotated_parts(csx)
+    for pts, ins in zip(ROTATED_REF, ROTATED_IN):
+        for q, p, want in zip(parts, pts, ins):
+            assert inside(q, [np.array([c], float) for c in p], grid)[0, 0, 0] == want, (q.kind, p)
+
+
+def test_rotpoly_and_rotations_xml_both_ways(tmp_path):
+    F = openEMS()
+    F.SetGaussExcite(2e9, 1e9)
+    csx = ContinuousStructure()
+    F.SetCSX(csx)
+    for a in 'xyz':
+        csx.GetGrid().SetLines(a, np.arange(-5, 5.01, 0.5))
+    _rotated_parts(csx)
+    fn = str(tmp_path / 'rot.xml')
+    F.Write2XML(fn)
+    G = openEMS()
+    G.ReadFromXML(fn)
+    disc, bar = G.csx.GetPropertiesByName('m')[0].primitives
+    assert isinstance(disc, C.RotPoly) and (disc.norm_dir, disc.rot_axis) == (1, 2) and not G.csx.skipped
+    np.testing.assert_allclose(disc.angles, [0, 2 * np.pi])
+    assert bar.transform == [(2, pytest.approx(np.pi / 2, abs=1e-12))]
+    grid = Grid(G.csx.GetGrid())
+    for pts, ins in zip(ROTATED_REF, ROTATED_IN):
+        for q, p, want in zip((disc, bar), pts, ins):
+            assert inside(q, [np.array([c], float) for c in p], grid)[0, 0, 0] == want, (q.kind, p)
+
+
+def test_a_transformation_gfdtd_cannot_apply_is_an_error(tmp_path):
+    """Dropping it would put the part in the wrong place without a word"""
+    with pytest.raises(ValueError, match='Translate'):
+        ContinuousStructure().AddMetal('m').AddBox([0, 0, 0], [1, 1, 1]).AddTransform('Translate', [1, 0, 0])
+    fn = tmp_path / 'model.xml'
+    fn.write_text(OPENEMS_XML.replace('<RotPoly ID="9" Name="odd"><Primitives /></RotPoly>', '').replace(
+        '</Cylinder>', '<Transformation><Translate Argument="1,0,0" /></Transformation></Cylinder>'))
+    with pytest.raises(ValueError, match='Translate'):
+        openEMS().ReadFromXML(str(fn))
 
 
 def _load_s11(tmp_path, backend='numpy', fill=None, **el):
