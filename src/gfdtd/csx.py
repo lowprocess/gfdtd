@@ -10,12 +10,14 @@ and CSXCAD's XML format both ways, so a model built for openEMS can be built, wr
 
 Properties: Material, DebyeMaterial, Metal, ConductingSheet, LumpedElement, Excitation (with weight functions or a
 mode file), ProbeBox (with mode functions or a mode file), DumpBox (and LorentzMaterial, read with its static
-epsilon). Primitives: Box, Polygon, LinPoly, Cylinder, CylindricalShell, Curve. Anything else in a file read here is
-kept out of the model and listed in `CSX.skipped`.
+epsilon). Primitives: Box, Polygon, LinPoly, RotPoly, Cylinder, CylindricalShell, Curve, each with CSXCAD's
+rotations about x, y, z (a Transformation of anything else is an error: dropping it would misplace the part).
+Anything else in a file read here is kept out of the model and listed in `CSX.skipped`.
 
 Weight and mode functions are CSXCAD's function-parser expressions in x, y, z, rho, a, r, t (drawing units, from
 the weight origin): evaluate(expr, coords) runs them on numpy arrays.
 """
+import math
 import re
 import xml.etree.ElementTree as ET
 
@@ -150,6 +152,16 @@ class Primitive:
 
     def __init__(self, prop, priority=0):
         self.prop, self.priority = prop, int(priority)
+        self.transform = []             # CSXCAD's transformation, rotations only: [(axis 0-2, angle rad)] in order
+
+    def AddTransform(self, transform, *args, **kw):
+        """CSXCAD's AddTransform for rotations: ('RotateAxis', 'x' | 'y' | 'z', angle in degrees)."""
+        if transform != 'RotateAxis':
+            raise ValueError(f"gfdtd: transform {transform!r} not supported (RotateAxis only)")
+        self.transform.append((ny_dir(args[0]), math.radians(float(args[1]))))
+
+    def HasTransform(self):
+        return bool(self.transform)
 
     def GetPriority(self):
         return self.priority
@@ -193,6 +205,19 @@ class LinPoly(Polygon):
     def __init__(self, prop, points, norm_dir, elevation, length, priority=0):
         super().__init__(prop, points, norm_dir, elevation, priority)
         self.length = _num(length)
+
+
+class RotPoly(Primitive):
+    """CSXCAD's RotPoly: a polygon in the plane normal to norm_dir, revolved about rot_axis (an axis of that plane)
+    over angles [start, stop] (radians). points = [X1s, X2s] in CSXCAD's vertex order: X1 along (norm_dir + 1) % 3,
+    X2 along (norm_dir + 2) % 3 (for norm_dir y: X1 is z, X2 is x)."""
+    kind = 'RotPoly'
+
+    def __init__(self, prop, points, norm_dir, elevation, rot_axis, angles, priority=0):
+        super().__init__(prop, priority)
+        self.points = np.asarray([np.asarray(points[0], float), np.asarray(points[1], float)])
+        self.norm_dir, self.elevation, self.rot_axis = ny_dir(norm_dir), _num(elevation), ny_dir(rot_axis)
+        self.angles = (float(angles[0]), float(angles[1]))
 
 
 class Cylinder(Primitive):
@@ -259,6 +284,9 @@ class Property:
 
     def AddLinPoly(self, points, norm_dir, elevation, length, priority=0, **kw):
         return self._add(LinPoly(self, points, norm_dir, elevation, length, priority))
+
+    def AddRotPoly(self, points, norm_dir, elevation, rot_axis, angle, priority=0, **kw):
+        return self._add(RotPoly(self, points, norm_dir, elevation, rot_axis, angle, priority))
 
     def AddCylinder(self, start, stop, radius, priority=0, **kw):
         return self._add(Cylinder(self, start, stop, radius, priority))
@@ -682,13 +710,21 @@ def _write_primitive(parent, q):
         el = ET.SubElement(parent, 'Curve', **pr)
         for P in q.points:
             ET.SubElement(el, 'Vertex', **_xyz(P))
-    else:                                                           # Polygon, LinPoly
+    else:                                                           # Polygon, LinPoly, RotPoly
         a = dict(pr, Elevation=_fmt(q.elevation), NormDir=str(q.norm_dir), QtyVertices=str(q.points.shape[1]))
         if isinstance(q, LinPoly):
             a['Length'] = _fmt(q.length)
+        if isinstance(q, RotPoly):
+            a['RotAxisDir'] = str(q.rot_axis)
         el = ET.SubElement(parent, q.kind, **a)
         for P in q.points.T:
             ET.SubElement(el, 'Vertex', **_xyz(P, ('X1', 'X2')))
+        if isinstance(q, RotPoly):
+            ET.SubElement(el, 'Angles', Start=_fmt(q.angles[0]), Stop=_fmt(q.angles[1]))
+    if q.transform:
+        tr = ET.SubElement(el, 'Transformation')
+        for ax, ang in q.transform:
+            ET.SubElement(tr, 'Rotate_' + 'XYZ'[ax], Argument=f"{ang:.15g}")
 
 
 def _point(el):
@@ -760,22 +796,33 @@ def _read_property(pe, skipped):
     prims = pe.find('Primitives')
     for q in (prims if prims is not None else []):
         pri = int(float(q.get('Priority', 0)))
+        prim = None
         if q.tag == 'Box':
-            p.AddBox(_point(q.find('P1')), _point(q.find('P2')), priority=pri)
+            prim = p.AddBox(_point(q.find('P1')), _point(q.find('P2')), priority=pri)
         elif q.tag in ('Cylinder', 'CylindricalShell'):
             shell = [float(q.get('ShellWidth'))] if q.tag == 'CylindricalShell' else []
-            getattr(p, 'Add' + q.tag)(_point(q.find('P1')), _point(q.find('P2')), float(q.get('Radius')), *shell,
-                                      priority=pri)
+            prim = getattr(p, 'Add' + q.tag)(_point(q.find('P1')), _point(q.find('P2')), float(q.get('Radius')),
+                                             *shell, priority=pri)
         elif q.tag == 'Curve':
-            p.AddCurve(np.array([_point(v) for v in q.findall('Vertex')]).T, priority=pri)
-        elif q.tag in ('Polygon', 'LinPoly'):
+            prim = p.AddCurve(np.array([_point(v) for v in q.findall('Vertex')]).T, priority=pri)
+        elif q.tag in ('Polygon', 'LinPoly', 'RotPoly'):
             vs = [(float(v.get('X1')), float(v.get('X2'))) for v in q.findall('Vertex')]
             pts = [np.array([u for u, _ in vs]), np.array([w for _, w in vs])]
             nd, el = int(q.get('NormDir', 2)), float(q.get('Elevation', 0))
             if q.tag == 'LinPoly':
-                p.AddLinPoly(pts, nd, el, float(q.get('Length', 0)), priority=pri)
+                prim = p.AddLinPoly(pts, nd, el, float(q.get('Length', 0)), priority=pri)
+            elif q.tag == 'RotPoly':
+                an = q.find('Angles')
+                prim = p.AddRotPoly(pts, nd, el, int(q.get('RotAxisDir', 2)),
+                                    (float(an.get('Start', 0)), float(an.get('Stop', 2 * math.pi))), priority=pri)
             else:
-                p.AddPolygon(pts, nd, el, priority=pri)
+                prim = p.AddPolygon(pts, nd, el, priority=pri)
         else:
             skipped.append(f"{p.kind} {name}: primitive {q.tag} not supported")
+        tr = q.find('Transformation')
+        if prim is not None and tr is not None:
+            for op in tr:                       # CSXCAD writes the rotation angles in radians
+                if op.tag not in ('Rotate_X', 'Rotate_Y', 'Rotate_Z'):
+                    raise ValueError(f"gfdtd: {p.kind} {name}: transformation {op.tag} not supported (rotations only)")
+                prim.transform.append(('XYZ'.index(op.tag[-1]), float(op.get('Argument'))))
     return p

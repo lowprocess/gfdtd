@@ -63,7 +63,7 @@ Stop and S-parameter code among them) work on gfdtd unchanged.
 | Materials | isotropic epsilon and conductivity (kappa), averaged over the four cells around each edge |
 | Dispersion | Debye materials (`DebyeMaterial`, any number of poles): `--diel wideband` |
 | Metal | `Metal` and `ConductingSheet`, both as PEC: no conductor loss (`--sigma` is ignored) |
-| Primitives | Box, Polygon, LinPoly, Cylinder, CylindricalShell, Curve (a wire along the mesh edges nearest to it, as openEMS's) |
+| Primitives | Box, Polygon, LinPoly, RotPoly (full turns), Cylinder, CylindricalShell, Curve (a wire along the mesh edges nearest to it, as openEMS's); rotations about x, y, z (`AddTransform('RotateAxis', ...)`, `<Transformation>`): any other transformation is an error |
 | Lumped elements | R, L, C: parallel, or series RLC (`LEtype=1`), with metal caps |
 | Ports | all of openEMS's Python ports: lumped, curve, microstrip (MSL), stripline, CPW, coaxial, rectangular and circular waveguide, any waveguide mode by functions or mode file ([Ports](#ports)) |
 | Excitations | soft and hard, E and H field (types 0-3), weighted by functions of x, y, z, rho, a, r, t or a mode file, delayed |

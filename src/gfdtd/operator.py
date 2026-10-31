@@ -24,6 +24,7 @@ and vi: unconditionally stable, for any tau. PML_n: the n outermost cells of a s
 centres (openEMS's dump mode 2), worked out by the engine.
 """
 from collections import defaultdict
+import math
 
 import numpy as np
 
@@ -81,11 +82,107 @@ def plane_points(q):
     return P[::-1] if q.norm_dir == 1 else P
 
 
+def _rotation(q):
+    """The 3 x 3 matrix of q's CSXCAD transformation (rotations about x, y, z applied in order): p_world = M p_local"""
+    M = np.eye(3)
+    for ax, ang in getattr(q, 'transform', ()):
+        c, s = math.cos(ang), math.sin(ang)
+        i, j = (ax + 1) % 3, (ax + 2) % 3
+        R = np.eye(3)
+        R[i, i], R[i, j], R[j, i], R[j, j] = c, -s, s, c
+        M = R @ M
+    return M
+
+
+def _local_bounds(q):
+    """(lo, hi) of q in its own frame, drawing units"""
+    if isinstance(q, C.RotPoly):
+        n, ra = q.norm_dir, q.rot_axis
+        X = q.points[0] if (n + 1) % 3 == ra else q.points[1]        # the coordinate along the rotation axis
+        rmax = float(np.max(np.abs(q.points[1] if (n + 1) % 3 == ra else q.points[0])))
+        lo, hi = np.full(3, -rmax), np.full(3, rmax)
+        lo[ra], hi[ra] = X.min(), X.max()
+        return lo, hi
+    if isinstance(q, C.Polygon):
+        n = q.norm_dir
+        u, v = [b for b in range(3) if b != n]
+        P = plane_points(q)
+        lo, hi = np.zeros(3), np.zeros(3)
+        lo[u], hi[u] = P[0].min(), P[0].max()
+        lo[v], hi[v] = P[1].min(), P[1].max()
+        lo[n], hi[n] = sorted((q.elevation, q.elevation + getattr(q, 'length', 0.0)))
+        return lo, hi
+    if isinstance(q, C.Box):
+        return np.minimum(q.start, q.stop), np.maximum(q.start, q.stop)
+    if isinstance(q, C.Cylinder):
+        rout = q.radius + (q.shell_width / 2 if isinstance(q, C.CylindricalShell) else 0.0)
+        p0, p1 = np.asarray(q.start, float), np.asarray(q.stop, float)
+        return np.minimum(p0, p1) - rout, np.maximum(p0, p1) + rout
+    raise ValueError(f"gfdtd: primitive {type(q).__name__} has no bounds")
+
+
+def _contains(q, L, tol):
+    """Point test of an N x 3 array L (drawing units, q's own frame) for the volume primitives, boundary included"""
+    import shapely
+    if isinstance(q, C.RotPoly):
+        n, ra = q.norm_dir, q.rot_axis
+        if ra not in ((n + 1) % 3, (n + 2) % 3):
+            raise ValueError("gfdtd: RotPoly's rotation axis must lie in its polygon's plane")
+        if abs(abs(q.angles[1] - q.angles[0]) - 2 * math.pi) > 1e-6:
+            raise ValueError("gfdtd: RotPoly over part of a turn not supported (full revolutions only)")
+        a1, a2 = (ra + 1) % 3, (ra + 2) % 3
+        rad, ax = np.hypot(L[:, a1], L[:, a2]), L[:, ra]
+        X1, X2 = (ax, rad) if (n + 1) % 3 == ra else (rad, ax)       # CSXCAD's vertex order (csx.RotPoly)
+        poly = shapely.Polygon(np.asarray(q.points).T)
+        poly = poly if poly.is_valid else poly.buffer(0)
+        return shapely.intersects_xy(poly.buffer(tol), X1, X2)
+    if isinstance(q, C.Polygon):
+        if not (isinstance(q, C.LinPoly) and abs(q.length) > 0):
+            raise ValueError("gfdtd: a flat Polygon with a transformation is not supported")
+        n = q.norm_dir
+        u, v = [b for b in range(3) if b != n]
+        lo, hi = sorted((q.elevation, q.elevation + q.length))
+        poly = shapely.Polygon(plane_points(q).T)
+        poly = poly if poly.is_valid else poly.buffer(0)
+        return (L[:, n] >= lo - tol) & (L[:, n] <= hi + tol) & shapely.intersects_xy(poly.buffer(tol), L[:, u], L[:, v])
+    if isinstance(q, C.Box):
+        lo, hi = np.minimum(q.start, q.stop), np.maximum(q.start, q.stop)
+        return np.all((L >= lo - tol) & (L <= hi + tol), axis=1)
+    if isinstance(q, C.Cylinder):
+        p0, ax = np.asarray(q.start, float), np.asarray(q.stop, float) - np.asarray(q.start, float)
+        t = ((L - p0) @ ax) / float(ax @ ax)
+        r = np.sqrt((((L - p0) - t[:, None] * ax) ** 2).sum(1))
+        ok = (t >= -1e-9) & (t <= 1 + 1e-9)
+        if isinstance(q, C.CylindricalShell):
+            return ok & (np.abs(r - q.radius) <= q.shell_width / 2 + tol)
+        return ok & (r <= q.radius + tol)
+    raise ValueError(f"gfdtd: primitive {type(q).__name__} not supported with a transformation")
+
+
+def _inside_points(q, pts, grid):
+    """inside() for the primitives without a tensor shortcut: a RotPoly, or any primitive with a transformation"""
+    M = _rotation(q)
+    lo, hi = _local_bounds(q)
+    corners = np.array([[(lo, hi)[k >> b & 1][b] for b in range(3)] for k in range(8)]) @ M.T
+    wlo, whi = corners.min(0), corners.max(0)
+    shape = tuple(len(x) for x in pts)
+    out = np.zeros(shape, bool)
+    idx = [np.nonzero(_range_mask(pts[a], wlo[a], whi[a], grid.tol[a]))[0] for a in range(3)]
+    if not all(len(i) for i in idx):
+        return out
+    P = np.stack(np.meshgrid(*[pts[a][idx[a]] for a in range(3)], indexing='ij'), -1).reshape(-1, 3)
+    m = _contains(q, P @ M, max(grid.tol))                     # world -> own frame: M^T p (rows: p M)
+    out[np.ix_(*idx)] = m.reshape([len(i) for i in idx])
+    return out
+
+
 def inside(q, pts, grid, flat_snap=True):
     """Boolean mask (len X, len Y, len Z) of the tensor-grid points pts = [X, Y, Z] inside primitive q (boundary
     included). Flat primitives sit on their nearest mesh line (flat_snap)."""
     import shapely
     shape = tuple(len(x) for x in pts)
+    if isinstance(q, C.RotPoly) or getattr(q, 'transform', None):
+        return _inside_points(q, pts, grid)
     if isinstance(q, C.Polygon):                                    # Polygon / LinPoly, normal n
         n = q.norm_dir
         u, v = [b for b in range(3) if b != n]
