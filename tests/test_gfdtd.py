@@ -8,7 +8,7 @@ import pytest
 from gfdtd import ContinuousStructure, openEMS
 from gfdtd import csx as C
 from gfdtd.engine import gpu_info, core_info
-from gfdtd.operator import build, timestep, Grid
+from gfdtd.operator import build, timestep, inside, Grid
 
 from openems_files import read_fd, read_vtr, steps_taken
 
@@ -187,6 +187,22 @@ def test_operator_metal_edges_and_dielectric_average(tmp_path):
     assert len(op.exc[0]) == 4                                        # 2 columns (y = 2, 3) x 2 z edges
     assert sorted(p['name'] for p in op.probes) == ['port_it_1', 'port_ut_1']
     assert [(sl['axis'], sl['hi'], sl['n']) for sl in op.pml] == [(1, 0, 4)]   # ymin PML_8: 4 of the 5 cells
+
+
+@pytest.mark.parametrize('nd', [0, 1, 2])
+def test_polygon_vertices_in_csxcads_order(nd):
+    """CSXCAD's vertex order is cyclic, X1 along (normal + 1) % 3 and X2 along (normal + 2) % 3 (a y normal: X1 is z,
+    X2 is x), as its IsInside has it: a triangle 4 long in X1 and 1 in X2 reaches 3 along X1's axis, not along X2's."""
+    csx = ContinuousStructure()
+    for a in 'xyz':
+        csx.GetGrid().SetLines(a, np.arange(-1, 5.01, 0.5))
+    grid = Grid(csx.GetGrid())
+    q = csx.AddMetal('m').AddLinPoly([np.array([0., 4, 0]), np.array([0., 0, 1])], 'xyz'[nd], -0.5, 1.0)
+    x1, x2 = (nd + 1) % 3, (nd + 2) % 3
+    for along, across, hit in ((x1, x2, True), (x2, x1, False)):
+        pts = [np.array([0.0]) for _ in range(3)]
+        pts[along], pts[across] = np.array([3.0]), np.array([0.1])
+        assert inside(q, pts, grid)[0, 0, 0] == hit
 
 
 def _load_s11(tmp_path, backend='numpy', fill=None, **el):
