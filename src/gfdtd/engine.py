@@ -626,12 +626,12 @@ class Engine:
         op, be = self.op, self.be
         dt, sig, sub = op.dt, op.signal, op.sub
         os.makedirs(path, exist_ok=True)
-        with open(os.path.join(path, 'et'), 'w') as fh:
+        with open(os.path.join(path, 'et'), 'w', encoding='utf-8') as fh:
             fh.write("% time-domain excitation signal by gfdtd\n% t/s\tvoltage\n")
             fh.writelines(f"{n * dt:.12g}\t{v:.12g}\n" for n, v in enumerate(sig))
         files = []
         for p in be.order:                                          # the probe files, with openEMS's headers
-            fh = open(os.path.join(path, p['name']), 'w')
+            fh = open(os.path.join(path, p['name']), 'w', encoding='utf-8')
             files.append(fh)
             what, u = 'voltage' if p['field'] == 'V' else 'current', p['unit']
             fh.write(f"% time-domain {what} integration by gfdtd @{time.ctime()}\n")

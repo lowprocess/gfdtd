@@ -311,7 +311,7 @@ extern "C" __global__ void dump(const float* V, const float* I, const float* G, 
 
 
 def source(code_t='unsigned short'):
-    with open(HEADER) as fh:
+    with open(HEADER, encoding='utf-8') as fh:
         head = fh.read()
     return (f"#define GF_DEV __device__ inline\n#define GF_ADD(p, v) atomicAdd((p), (v))\n#define CODE_T {code_t}\n" +
             head + KERNELS)

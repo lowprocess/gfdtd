@@ -148,7 +148,7 @@ def write_vtr(path, coords, data, name):
                 f'RangeMax="{c.max():g}">', '        ' + _b64_block(c.tobytes()), '      </DataArray>']
     out += ['    </Coordinates>', '  </Piece>', '  </RectilinearGrid>', '</VTKFile>', '']
     tmp = path + '.part'
-    with open(tmp, 'w') as fh:
+    with open(tmp, 'w', encoding='utf-8') as fh:
         fh.write('\n'.join(out))
     os.replace(tmp, path)                                           # a live viewer never sees half a frame
 

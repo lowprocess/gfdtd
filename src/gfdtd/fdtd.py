@@ -180,7 +180,7 @@ class openEMS:                                                       # noqa: N80
             if log is None:
                 out = lambda line: print(line, flush=True)
             else:
-                fh = stack.enter_context(open(log, 'a'))
+                fh = stack.enter_context(open(log, 'a', encoding='utf-8'))
 
                 def out(line):
                     fh.write(line + '\n')
@@ -215,7 +215,7 @@ class openEMS:                                                       # noqa: N80
 def read_probe(path):
     """(t, values) of an openEMS / gfdtd probe file."""
     rows = []
-    with open(path) as fh:
+    with open(path, encoding='utf-8') as fh:
         for line in fh:
             if line.strip() and not line.startswith('%'):
                 rows.append(line.split()[:2])

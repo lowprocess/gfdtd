@@ -25,7 +25,7 @@ from .constants import C0, EPS0, MU0 as MUE0, ETA0 as Z0         # noqa: F401  (
 def _load_ui_file(path):
     """(data (N, cols), column names) of a probe file: the last header line names the columns."""
     comments, rows = [], []
-    with open(path) as fh:
+    with open(path, encoding='utf-8') as fh:
         for line in fh:
             if line.startswith('%'):
                 comments.append(line[1:].strip())
