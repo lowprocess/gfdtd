@@ -11,6 +11,16 @@
 
 typedef long long idx_t;
 
+// a vectorisation hint for the loops over z; MSVC's OpenMP (/openmp:llvm) refuses 'omp simd' without
+// /openmp:experimental, so it goes without (the compiler still vectorises what it can)
+#ifndef GF_SIMD
+#if defined(_MSC_VER) && !defined(__clang__)
+#define GF_SIMD
+#else
+#define GF_SIMD _Pragma("omp simd")
+#endif
+#endif
+
 // a PML term added to a field: the GPU runs all slabs at once and the slabs meet at the corners, so atomically
 #ifndef GF_ADD
 #define GF_ADD(p, v) (*(p) += (v))
@@ -166,19 +176,19 @@ GF_DEV void gf_h_row(int i, int j, const float* V, float* I, const float* G, Dim
     const bool jy = j < D.ny - 1, ix = i < D.nx - 1;
     if (jy) {
         const float f = kh * GF_G(G, D, 2, 0, i) * GF_G(G, D, 1, 1, j);
-#pragma omp simd
+GF_SIMD
         for (int k = 0; k < kz; ++k)
             Ix[k] -= f * idz[k] * (Vz[k + sy] - Vz[k] - Vy[k + 1] + Vy[k]);
     }
     if (ix) {
         const float f = kh * GF_G(G, D, 2, 1, j) * GF_G(G, D, 1, 0, i);
-#pragma omp simd
+GF_SIMD
         for (int k = 0; k < kz; ++k)
             Iy[k] -= f * idz[k] * (Vx[k + 1] - Vx[k] - Vz[k + sx] + Vz[k]);
     }
     if (ix && jy) {
         const float f = kh * GF_G(G, D, 1, 0, i) * GF_G(G, D, 1, 1, j);
-#pragma omp simd
+GF_SIMD
         for (int k = 0; k < D.nz; ++k)
             Iz[k] -= f * dualz[k] * (Vy[k + sx] - Vy[k] - Vx[k + sy] + Vx[k]);
     }
@@ -193,7 +203,7 @@ GF_DEV void gf_e_row_comp(int a, idx_t t0, int kn, float* Vr, const float* Pp, c
                           int P, const int* slot, float* pol, float dt, idx_t n, float* old, bool poles)
 {
     const C* cd = code + t0;
-#pragma omp simd
+GF_SIMD
     for (int k = 0; k < kn; ++k) {
         const float v0 = Vr[k];
         const idx_t q = (idx_t)cd[k] * 3 + a;

@@ -143,7 +143,7 @@ static void pml(arr<float> V, arr<float> I, arr<float> psi, arr<float> b, arr<fl
                 float *p1 = ps + e0, *p2 = ps + m + e0;
                 const float *r1 = R + o1 + t0, *r2 = R + o2 + t0, *f1 = q1 + e0, *f2 = q2 + e0;
                 float *w1 = W + o1 + t0, *w2 = W + o2 + t0;
-#pragma omp simd
+GF_SIMD
                 for (int lk = 0; lk < L2; ++lk) {
                     const int la = a == 2 ? lk : la0, ia = la + s0;
                     float d2, d1;
