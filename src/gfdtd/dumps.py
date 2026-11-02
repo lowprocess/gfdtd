@@ -17,6 +17,19 @@ VTK_NAME = {'E': 'E-Field', 'H': 'H-Field', 'J': 'J-Field', 'Jc': 'Jc-Field'}
 BLOCK = 32768           # VTK's compressed block size
 
 
+def replace(tmp, path, tries=50):
+    """os.replace(tmp, path), tried again for a while where Windows refuses it: a file another program has open (the
+    GUI reading the last frame) cannot be replaced there until it is closed."""
+    import time
+    for k in range(tries):
+        try:
+            return os.replace(tmp, path)
+        except PermissionError:
+            if k == tries - 1:
+                raise
+            time.sleep(0.02)
+
+
 def _take(xp, F, lo, hi):
     """F[lo:hi + 1] on each axis, with zeros where the range runs past the array."""
     out = xp.zeros([h - l + 1 for l, h in zip(lo, hi)], F.dtype)
@@ -150,7 +163,7 @@ def write_vtr(path, coords, data, name):
     tmp = path + '.part'
     with open(tmp, 'w', encoding='utf-8') as fh:
         fh.write('\n'.join(out))
-    os.replace(tmp, path)                                           # a live viewer never sees half a frame
+    replace(tmp, path)                                              # a live viewer never sees half a frame
 
 
 def write_h5(path, d, freqs, data):
@@ -172,7 +185,7 @@ def write_h5(path, d, freqs, data):
             ds = fd.create_dataset(f'f{i}', data=np.ascontiguousarray(np.transpose(v, (3, 0, 1, 2)), np.complex64))
             ds.attrs['d_order'] = 'NXYZ'
             ds.attrs['frequency'] = np.float64(f)
-    os.replace(tmp, path)
+    replace(tmp, path)
 
 
 class Dumps:
