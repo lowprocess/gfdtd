@@ -8,7 +8,7 @@
 
 #include "fdtd_core.h"
 
-#if defined(__SSE__) || defined(__x86_64__)
+#if defined(__SSE__) || defined(__x86_64__) || defined(_M_X64)       // _M_X64: MSVC
 #include <xmmintrin.h>
 // denormals flushed to zero in the core's threads while it runs (the GPU does this anyway): the fields grow from
 // zero, and the tiny values ahead of a wave ran the first few thousand steps 5-10x slower; restored afterwards

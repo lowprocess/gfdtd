@@ -18,11 +18,12 @@ there.
 ```bash
 pip install .                       # numpy, scipy, shapely, h5py, emsdev (the GPU probe, CPU threads)
 pip install '.[gpu-rocm7]'          # the GPU: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
-pip install '.[core]'               # pybind11, then build the CPU core (g++ with OpenMP):
+pip install '.[core]'               # pybind11, then build the CPU core (g++ with OpenMP; Windows: MSVC or MinGW):
 python -m gfdtd.core.build          # src/gfdtd/_core*.so; GFDTD_ARCH=-march=x86-64-v3 for a portable build
 ```
 
-The CuPy extras conflict: install one. The CUDA wheels need the NVIDIA driver; the ROCm wheel the ROCm 7 runtime.
+The CuPy extras conflict: install one. The CUDA wheels need the NVIDIA driver; the ROCm wheel the ROCm 7 runtime
+(Linux only: CuPy has no ROCm wheel for Windows).
 Without the core the CPU runs on numpy, some 15 times slower. The backend is picked per run (`backend='auto'`:
 the GPU when CuPy finds one, else the core, else numpy); `GFDTD_BACKEND=cupy|core|numpy` overrides it for every
 run.

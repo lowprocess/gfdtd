@@ -1,5 +1,5 @@
 // gfdtd's update maths, one node at a time: shared by the GPU kernels (kernels.py: CUDA / HIP through nvrtc /
-// hiprtc) and the CPU core (gfdtd_core.cpp: g++ with OpenMP), so the two run the same arithmetic.
+// hiprtc) and the CPU core (gfdtd_core.cpp: g++ or MSVC with OpenMP), so the two run the same arithmetic.
 //
 // Fields V, I: float32 (3, nx, ny, nz), z fastest. The compressed operator (operator.Compressed): per node a
 // code into tables vv / s / pole of its three E edges ([code * 3 + a]); vi = ke * d_a / (dual_b dual_c) * s and iv = kh * dual_a / (d_b d_c) from the
