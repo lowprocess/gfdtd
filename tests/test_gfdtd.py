@@ -100,7 +100,7 @@ OPENEMS_XML = '''<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
 
 def test_reads_openems_xml(tmp_path):
     fn = tmp_path / 'model.xml'
-    fn.write_text(OPENEMS_XML)
+    fn.write_text(OPENEMS_XML, encoding='utf-8')
     F = openEMS()
     F.ReadFromXML(str(fn))
     assert F.bc == ['MUR', 'MUR', 'PML_8', 'PEC', 'PMC', 'MUR']          # names, and openEMS's numbers (2: MUR)
@@ -168,7 +168,7 @@ def test_operator_metal_edges_and_dielectric_average(tmp_path):
     """A sheet on a mesh line takes the edges inside it; an edge on a dielectric's top face averages the two media;
     a via takes the z edges through it."""
     fn = tmp_path / 'model.xml'
-    fn.write_text(OPENEMS_XML)
+    fn.write_text(OPENEMS_XML, encoding='utf-8')
     F = openEMS()
     F.ReadFromXML(str(fn))
     op = build(F.csx, F.settings())
@@ -286,7 +286,7 @@ def test_debye_material_xml_both_ways(tmp_path):
     m.AddBox([0, 0, 0], [1, 1, 1])
     fn = str(tmp_path / 'm.xml')
     csx.Write2XML(fn)
-    text = open(fn).read()
+    text = open(fn, encoding='utf-8').read()
     assert 'EpsilonDelta_2="5.000000e-01' in text and 'EpsilonRelaxTime_1="3.000000e-11' in text   # CSXCAD's names
     back = ContinuousStructure()
     back.ReadFromXML(fn)
@@ -504,7 +504,7 @@ def test_probe_files_are_openems_format(tmp_path):
     _, _, res, path = _load_s11(tmp_path, R=50.0)
     names = sorted(os.listdir(path))
     assert {'et', 'port_ut_1', 'port_it_1'} <= set(names)
-    head = open(os.path.join(path, 'port_it_1')).read().splitlines()[:4]
+    head = open(os.path.join(path, 'port_it_1'), encoding='utf-8').read().splitlines()[:4]
     assert head[3].split() == ['%', 't/s', 'current']
     n = steps_taken(path)                                             # read as openEMS's files are read
     assert n is not None and abs(n - res['steps']) <= 200
@@ -513,7 +513,7 @@ def test_probe_files_are_openems_format(tmp_path):
 def test_abort_file_ends_a_run(tmp_path):
     path = tmp_path / 'run_numpy'
     path.mkdir()
-    (path / 'ABORT').write_text('')
+    (path / 'ABORT').write_text('', encoding='utf-8')
     _, _, res, _ = _load_s11(tmp_path, R=50.0)
     assert res['reason'] == 'abort' and res['steps'] == 100
 
@@ -574,21 +574,21 @@ def test_gpu_runs_in_threads(tmp_path):
 def test_run_writes_its_log(tmp_path, capsys):
     """Run(log=path): the output into the file (for runs in threads), none on stdout."""
     fn = tmp_path / 'model.xml'
-    fn.write_text(OPENEMS_XML)
+    fn.write_text(OPENEMS_XML, encoding='utf-8')
     F = openEMS()
     F.ReadFromXML(str(fn))
     log = tmp_path / 'run.log'
     capsys.readouterr()
     F.Run(str(tmp_path / 'logged'), log=str(log), backend='numpy')
     assert capsys.readouterr().out == ''
-    text = log.read_text()
+    text = log.read_text(encoding='utf-8')
     assert 'FDTD timestep is' in text and 'Time for ' in text and 'iterations' in text
 
 
 def test_command_line_runs_an_xml(tmp_path, capsys):
     from gfdtd.fdtd import main
     fn = tmp_path / 'model.xml'
-    fn.write_text(OPENEMS_XML)
+    fn.write_text(OPENEMS_XML, encoding='utf-8')
     assert main([str(fn), '--backend', 'numpy', '--path', str(tmp_path / 'run')]) == 0
     out = capsys.readouterr().out
     assert 'note: RotPoly odd' in out and 'Timestep' in out

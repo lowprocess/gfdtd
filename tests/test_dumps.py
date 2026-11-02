@@ -6,8 +6,8 @@ from gfdtd import dumps
 
 def test_replace_waits_for_a_reader(tmp_path, monkeypatch):
     tmp, path = tmp_path / 'f.part', tmp_path / 'f.vtr'
-    tmp.write_text('new')
-    path.write_text('old')
+    tmp.write_text('new', encoding='utf-8')
+    path.write_text('old', encoding='utf-8')
     real, refused = os.replace, []
 
     def flaky(a, b):
@@ -17,7 +17,7 @@ def test_replace_waits_for_a_reader(tmp_path, monkeypatch):
         return real(a, b)
     monkeypatch.setattr(dumps.os, 'replace', flaky)
     dumps.replace(str(tmp), str(path))
-    assert path.read_text() == 'new' and len(refused) == 3 and not tmp.exists()
+    assert path.read_text(encoding='utf-8') == 'new' and len(refused) == 3 and not tmp.exists()
 
 
 def test_replace_gives_up(tmp_path, monkeypatch):

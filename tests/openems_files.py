@@ -74,7 +74,7 @@ def read_fd(path):
 def _times(fn, n=None):
     """The first column of a text probe file (comment lines start with %); the first n values, or all."""
     out = []
-    with open(fn) as fh:
+    with open(fn, encoding='utf-8') as fh:
         for line in fh:
             if line.strip() and not line.startswith('%'):
                 out.append(float(line.split()[0]))
