@@ -1,12 +1,13 @@
 """
 Hot-loop benchmark of gfdtd's engine: the time per timestep of each operation, by backend and model size.
 
-    python tools/bench.py [--backends cupy,core,numpy] [--sizes 0.1,1,4,16] [--steps 200] [--bc PML_8]
+    python tools/bench.py [--backends cupy,vulkan,core,numpy] [--sizes 0.1,1,4,16] [--steps 200] [--bc PML_8]
 
 The model is a microstrip on a Debye substrate (one pole), two ports and a series RLC part, with PML (or --bc) on
 five sides and PEC below: about N million cells, x : y : z = 4 : 2 : 1. "wall" is the engine's own step (the GPU's:
 three fused launches) with a probe sample every 25 steps, synchronised once at the end. The breakdown below it
-times each operation run on its own (the GPU: events around each kernel, which add a little each).
+times each operation run on its own (CuPy: events around each kernel, which add a little each; Vulkan: each
+operation `steps` times between two syncs).
 """
 import argparse, contextlib, io, os, sys, time
 
@@ -70,6 +71,13 @@ def bench(op, backend, steps):
             ev[-1].synchronize()
             for i, n in enumerate(OPS):
                 t[n] += cp.cuda.get_elapsed_time(ev[i], ev[i + 1]) * 1e-3
+    elif be.name == 'vulkan':                                       # each operation `steps` times between syncs
+        for n, f in calls:
+            a = time.perf_counter()
+            for _ in range(steps):
+                _call(n, f)
+            be.sync()
+            t[n] = (time.perf_counter() - a)
     else:
         for _ in range(steps):
             for n, f in calls:
@@ -91,7 +99,7 @@ def bench(op, backend, steps):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--backends', default='cupy,core,numpy')
+    ap.add_argument('--backends', default='cupy,vulkan,core,numpy')
     ap.add_argument('--sizes', default='0.1,1,4')
     ap.add_argument('--steps', type=int, default=100)
     ap.add_argument('--bc', default='PML_8')

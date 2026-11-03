@@ -1,5 +1,5 @@
 """gfdtd: CSXCAD / openEMS compatibility (the API, XML both ways), the operator, the physics on small models with
-known answers (numpy backend; the GPU backend against it when CuPy finds a GPU)."""
+known answers (numpy backend; the GPU backends against it: CuPy's when it finds a GPU, Vulkan's when slangpy does)."""
 import os
 
 import numpy as np
@@ -8,9 +8,23 @@ import pytest
 from gfdtd import ContinuousStructure, openEMS
 from gfdtd import csx as C
 from gfdtd.engine import gpu_info, core_info
+from emsdev import gpu as _devices
 from gfdtd.operator import build, timestep, Grid
 
 from openems_files import read_fd, read_vtr, steps_taken
+
+
+def _has(probe):
+    try:
+        probe()
+        return True
+    except _devices.Unavailable:
+        return False
+
+
+# the GPU backends there are here: each runs the GPU tests
+GPUS = [pytest.param(b, marks=pytest.mark.skipif(not _has(p), reason=f'no GPU for {b}'))
+        for b, p in (('cupy', lambda: _devices.cupy_device(0)), ('vulkan', _devices.vulkan_device))]
 
 # as CSXCAD 0.7 / openEMS 0.37 write it (FDTD.Write2XML), trimmed
 OPENEMS_XML = '''<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
@@ -518,10 +532,10 @@ def test_abort_file_ends_a_run(tmp_path):
     assert res['reason'] == 'abort' and res['steps'] == 100
 
 
-@pytest.mark.skipif(not gpu_info()[0], reason='no GPU for CuPy')
-def test_gpu_matches_numpy(tmp_path):
+@pytest.mark.parametrize('gpu', GPUS)
+def test_gpu_matches_numpy(tmp_path, gpu):
     _, a, _, pa = _load_s11(tmp_path / 'n', backend='numpy', R=20.0, L=5e-9, C=2e-12, LEtype=1)
-    _, b, _, pb = _load_s11(tmp_path / 'g', backend='cupy', R=20.0, L=5e-9, C=2e-12, LEtype=1)
+    _, b, _, pb = _load_s11(tmp_path / 'g', backend=gpu, R=20.0, L=5e-9, C=2e-12, LEtype=1)
     np.testing.assert_allclose(a, b, atol=1e-4)
     from gfdtd.fdtd import read_probe
     np.testing.assert_allclose(read_probe(os.path.join(pa, 'port_ut_1'))[1], read_probe(os.path.join(pb, 'port_ut_1'))[1],
@@ -533,15 +547,15 @@ NODE_DUMPS = [('Hn', dict(dump_type=11, file_type=1, dump_mode=1, frequency=[8e9
               ('Jn', dict(dump_type=13, file_type=1, dump_mode=1, frequency=[8e9]), ([-6, -6, 1], [6, 6, 1]))]
 
 
-@pytest.mark.skipif(not gpu_info()[0], reason='no GPU for CuPy')
+@pytest.mark.parametrize('gpu', GPUS)
 @pytest.mark.parametrize('mode', ['fused', 'split', 'separate'])
-def test_gpu_matches_numpy_with_pml_debye_and_dumps(tmp_path, monkeypatch, mode):
+def test_gpu_matches_numpy_with_pml_debye_and_dumps(tmp_path, monkeypatch, mode, gpu):
     """The GPU's three ways of running a step (PML in the H / E kernels, as its own launches, every extension
     apart), and its dump kernel (every field and dump mode), against numpy."""
     import glob
     monkeypatch.setenv('GFDTD_STEP', mode)
     _, a, pa, _ = _plate_wave(tmp_path, 50, 'PML_8', 'numpy', dumps=DUMPS + NODE_DUMPS, debye=True)
-    _, b, pb, F = _plate_wave(tmp_path, 50, 'PML_8', 'cupy', dumps=DUMPS + NODE_DUMPS, debye=True)
+    _, b, pb, F = _plate_wave(tmp_path, 50, 'PML_8', gpu, dumps=DUMPS + NODE_DUMPS, debye=True)
     np.testing.assert_allclose(a, b, atol=1e-5 * np.abs(a).max())
     for f in glob.glob(os.path.join(pa, '*.h5')):
         fa, fb = read_fd(f)[1][0][1], read_fd(f.replace(pa, pb))[1][0][1]
@@ -553,17 +567,18 @@ def test_gpu_matches_numpy_with_pml_debye_and_dumps(tmp_path, monkeypatch, mode)
         np.testing.assert_allclose(A, B, atol=1e-5 * np.abs(A).max())
 
 
-@pytest.mark.skipif(not gpu_info()[0], reason='no GPU for CuPy')
-def test_gpu_runs_in_threads(tmp_path):
-    """Runs in threads (a GPU stream each, the output in a log file each) give what they give one at a time."""
+@pytest.mark.parametrize('gpu', GPUS)
+def test_gpu_runs_in_threads(tmp_path, gpu):
+    """Runs in threads (a GPU stream each - Vulkan: a device each -, the output in a log file each) give what they
+    give one at a time."""
     import threading
     from gfdtd.engine import concurrent_runs
     assert concurrent_runs(0.29e6, 4) == 4 and concurrent_runs(0.59e6, 4) == 2 and concurrent_runs(2e6, 4) == 1
-    _, ref, _, _ = _plate_wave(tmp_path / 'one', 50, 'PML_8', 'cupy', debye=True)
+    _, ref, _, _ = _plate_wave(tmp_path / 'one', 50, 'PML_8', gpu, debye=True)
     got = {}
 
     def run(n):
-        got[n] = _plate_wave(tmp_path / f't{n}', 50, 'PML_8', 'cupy', debye=True)[1]
+        got[n] = _plate_wave(tmp_path / f't{n}', 50, 'PML_8', gpu, debye=True)[1]
     th = [threading.Thread(target=run, args=(n,)) for n in range(3)]
     [t.start() for t in th]
     [t.join() for t in th]

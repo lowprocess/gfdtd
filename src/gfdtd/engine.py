@@ -5,9 +5,10 @@ lines on stdout, its probe files (port_ut_1 ...) and its dump files in the run f
 
     Engine(op, backend='auto').run(path, nr_ts, end_crit)
 
-Backends: cupy (the GPU: CUDA or ROCm) and core (the compiled CPU core, gfdtd._core: OpenMP) run the compressed
-operator (operator.compress: material codes and line arrays in place of the coefficient arrays) through the same
-update code (core/fdtd_core.h); numpy runs the dense coefficient arrays, slowly: the reference.
+Backends: cupy (the GPU: CUDA or ROCm), vulkan (the GPU through Vulkan and slangpy: AMD on Windows, any Vulkan GPU)
+and core (the compiled CPU core, gfdtd._core: OpenMP) run the compressed operator (operator.compress: material codes
+and line arrays in place of the coefficient arrays) through the same update code (core/fdtd_core.h); numpy runs the
+dense coefficient arrays, slowly: the reference.
 
 A file ABORT in the run folder ends the run as with openEMS (kicad2ems's port watch and Stop use it).
 """
@@ -26,12 +27,48 @@ CHECK_STEPS = 100       # timesteps between energy / ABORT checks (one host sync
 CHUNK = 512             # probe samples kept on the device before they are written out
 
 
+def _gpu_probes():
+    """(name, probe) for each GPU backend, in emsdev's 'auto' order: Vulkan first, CuPy first only on CUDA."""
+    probes = dict(cupy=lambda: devices.cupy_device(0), vulkan=lambda: devices.vulkan_device(need=VULKAN_NEEDS))
+    return [(n, probes[n]) for n in devices.auto_order()]
+
+
 def gpu_info():
-    """(usable, one line): is there a CuPy and a GPU it can run on?"""
+    """(usable, one line): is there a GPU to run on, through the backend 'gpu' picks (gpu_backend)?"""
+    why = []
+    for _, probe in _gpu_probes():
+        try:
+            return True, probe().describe()
+        except devices.Unavailable as e:                            # no CuPy / slangpy, no driver, a broken install
+            why.append(str(e))
+    return False, "no GPU: " + "; ".join(why)
+
+
+VULKAN_NEEDS = ('bda', 'int64', 'float64', 'atomic_add_f32')       # the Slang kernels' features (emsdev.vulkan)
+
+
+def backend_info(name):
+    """One line: what backend `name` (as resolve_backend gives it) runs on."""
     try:
-        return True, devices.cupy_device(0).describe()
-    except devices.Unavailable as e:                                # no CuPy, no driver, a broken install
-        return False, f"no GPU: {e}"
+        if name == 'cupy':
+            return devices.cupy_device(0).describe()
+        if name == 'vulkan':
+            return devices.vulkan_device(need=VULKAN_NEEDS).describe()
+    except devices.Unavailable as e:
+        return f"no GPU: {e}"
+    return core_info()[1] if name == 'core' else 'numpy (slow)'
+
+
+def gpu_backend():
+    """The GPU backend 'gpu' means here, or None: Vulkan (slangpy) first, CuPy first only where it runs on CUDA
+    (emsdev.gpu.auto_order)."""
+    for name, probe in _gpu_probes():
+        try:
+            probe()
+            return name
+        except devices.Unavailable:
+            pass
+    return None
 
 
 def core_info():
@@ -54,13 +91,19 @@ def concurrent_runs(cells, runs):
 
 
 def resolve_backend(name='auto'):
-    """'cupy', 'core' or 'numpy' for a backend name: auto (the GPU, else the core, else numpy), gpu / cupy, cpu (the
-    core, else numpy), core, numpy. GFDTD_BACKEND overrides it."""
-    name = devices.preference(name, 'GFDTD_BACKEND', dict.fromkeys(('gpu', 'cuda', 'rocm', 'hip'), 'cupy'))
-    if name in ('cpu', 'auto'):
-        name = 'cupy' if name == 'auto' and gpu_info()[0] else ('core' if core_info()[0] else 'numpy')
-    if name not in ('cupy', 'core', 'numpy'):
-        raise ValueError(f"gfdtd: backend {name!r}: auto, cupy (gpu), core or numpy (cpu)")
+    """'cupy', 'vulkan', 'core' or 'numpy' for a backend name: auto (the GPU, else the core, else numpy), gpu (Vulkan's
+    GPU, else CuPy's; CuPy's first on CUDA), cupy (cuda, rocm, hip), vulkan (vk), cpu (the core, else numpy), core, numpy.
+    GFDTD_BACKEND overrides it."""
+    name = devices.preference(name, 'GFDTD_BACKEND', dict(cuda='cupy', rocm='cupy', hip='cupy', vk='vulkan'))
+    if name in ('gpu', 'auto'):
+        gpu = gpu_backend()
+        if gpu or name == 'gpu':
+            return gpu or 'vulkan'                                  # gpu without one: the Vulkan error says why
+        name = 'cpu'
+    if name == 'cpu':
+        name = 'core' if core_info()[0] else 'numpy'
+    if name not in ('cupy', 'vulkan', 'core', 'numpy'):
+        raise ValueError(f"gfdtd: backend {name!r}: auto, gpu (vulkan, cupy), cpu (core, numpy)")
     return name
 
 
@@ -319,6 +362,20 @@ class NumpyBackend:
     def sync(self):
         pass
 
+    def to_host(self, a):
+        """A backend array as numpy."""
+        return np.asarray(a)
+
+    def fields(self):
+        """(V, I) as arrays of xp (the dumps without a kernel compute on them)."""
+        return self.V, self.I
+
+    def zeros(self, shape, dtype=np.float32):
+        return self.xp.zeros(shape, dtype)
+
+    def up(self, a, dtype=None):
+        return self.xp.asarray(a, dtype)
+
 
 class _Compressed:
     """Setup shared by the backends on the compressed operator: its tables on the device (xp)."""
@@ -426,14 +483,7 @@ class CupyBackend(_Compressed, NumpyBackend):
         self.n_pl = len(self.pl_idx) if op.par_L else 0
         self.n_se = len(self.se_idx) if op.series else 0
         self.n_mu = len(self.m0) if op.mur is not None else 0
-        sets = [np.asarray(op.exc[0]), np.array([e for e, _ in op.par_L], np.int64),
-                np.array([e[0] for e in op.series], np.int64)]
-        mur = [op.mur[0], op.mur[1]] if op.mur is not None else []
-        flat = np.concatenate([np.unique(x) for x in sets] + [np.unique(np.concatenate(mur))] if mur else
-                              [np.unique(x) for x in sets])
-        dup = len(np.unique(flat)) < len(flat) or len(set(e for e, _ in op.par_L)) < len(op.par_L) or \
-            len(set(e[0] for e in op.series)) < len(op.series)
-        self.fused = not dup
+        self.fused = _post_disjoint(op)
         pE, pH = getattr(self, 'pmlE', None), getattr(self, 'pmlH', None)
         self.ns = np.int32(len(self.pml))
         self.hE = (pE['psi'], pE['b'], pE['c'], pE['desc']) if pE else (z32, z32, z32, z64)
@@ -603,10 +653,369 @@ class CupyBackend(_Compressed, NumpyBackend):
     def sync(self):
         self.cp.cuda.get_current_stream().synchronize()
 
+    def to_host(self, a):
+        return self.cp.asnumpy(a)
+
+    def dump_kernel(self, region, out, nf, t):
+        m = int(np.prod(region.shape)) * 3
+        self.k['dump'](((m + self.BLOCK - 1) // self.BLOCK,), (self.BLOCK,), (self.V, self.I, self.G, *self.dims,
+                                                                              *region.args, np.int32(nf),
+                                                                              region.omega, np.float32(t), out))
+
+
+class _Dev:
+    """A device array of the Vulkan backend: its buffer, address and length (len() as a numpy array's)."""
+    __slots__ = ('buf', 'addr', 'n', 'dtype', 'shape')
+
+    def __init__(self, buf, n, dtype, shape=None):
+        self.buf, self.addr, self.n, self.dtype = buf, buf.device_address, int(n), np.dtype(dtype)
+        self.shape = shape if shape is not None else (self.n,)
+
+    def __len__(self):
+        return self.n
+
+
+class VulkanBackend(_Compressed, NumpyBackend):
+    """The GPU through Vulkan (slangpy: Slang kernels, kernels_vk.py) on the compressed operator: AMD on Windows,
+    where CuPy has no ROCm build, and any other Vulkan GPU. The same steps as the CuPy backend (fused / split /
+    separate), recorded into command buffers that are submitted every SUBMIT launches and at each host read, so
+    the host records while the GPU runs."""
+    name = 'vulkan'
+    BLOCK = 64                  # threads a workgroup: 64 ran 1-4 % faster than 128 / 256 on an RX 7800 XT
+    SUBMIT = 96                 # launches per command buffer, at most
+    FIRST = 6                   # the first after a sync: the GPU starts while the host records the rest (it is
+                                # idle after each sync, the energy check's every CHECK_STEPS)
+    NBLK = 1024                 # the energy kernel's workgroups
+    IDX = np.int32              # the kernels' index type (kernels_vk.source idx: int); GFDTD_VK_IDX=64 for int64
+
+    def __init__(self, op, dtype=np.float32):
+        from emsdev import vulkan
+        from . import kernels_vk
+        if dtype != np.float32:
+            raise ValueError("gfdtd: the GPU kernels are float32")
+        try:
+            vulkan.device(need=VULKAN_NEEDS)
+            self.dev = vulkan.slang_device()
+        except vulkan.Unavailable as e:
+            raise RuntimeError(f"gfdtd: no Vulkan GPU: {e}")
+        import slangpy as spy
+        self.spy, self.op, self.dt, self.xp = spy, op, dtype, np
+        nx, ny, nz = op.shape
+        self.n = nx * ny * nz
+        if 3 * self.n >= 2 ** 31:
+            raise ValueError(f"gfdtd: {self.n / 1e6:.0f} M nodes - the GPU kernels take up to 715 M")
+        self._keep, self.enc, self.launches, self.batch = [], None, 0, self.FIRST
+        self.usage = spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access | \
+            spy.BufferUsage.copy_source | spy.BufferUsage.copy_destination
+        self.max_groups = int(self.dev.info.limits.max_compute_dispatch_thread_groups[0])
+        self._tables()                                              # host arrays (xp = numpy), uploaded below
+        self._sparse()
+        ctype = {np.dtype(np.uint8): 'uint8_t', np.dtype(np.uint16): 'uint16_t'}.get(np.dtype(self.code.dtype),
+                                                                                    'uint32_t')
+        if os.environ.get('GFDTD_VK_IDX') == '64':
+            self.IDX = np.int64
+        self.BLOCK = int(os.environ.get('GFDTD_VK_BLOCK') or self.BLOCK)
+        self.k = _vk_kernels(self.dev, ctype, self.BLOCK, 'int64_t' if self.IDX == np.int64 else 'int')
+        f = {}                                                      # Model's fields: addresses, then values
+        self.V = self.zeros((3,) + op.shape)
+        self.I = self.zeros((3,) + op.shape)
+        f.update(V=self.V, I=self.I, G=self.up(self.G), code=self.up(self.code), tvv=self.up(self.tvv),
+                 ts=self.up(self.ts), tpole=self.up(self.tpole), tkb=self.up(self.tkb), tka=self.up(self.tka),
+                 th=self.up(self.th), slot=self.up(self.slot), pol=self.up(self.pol))
+        self._pml_all(f)
+        self.exc_idx, self.exc_amp = self.up(self.exc_idx, self.IDX), self.up(self.exc_amp)
+        f.update(ex_idx=self.exc_idx, ex_amp=self.exc_amp)
+        for g in self.more:
+            g['idx'], g['amp'] = self.up(g['idx'], self.IDX), self.up(g['amp'])
+        if op.par_L:
+            f.update(pl_vi=self.up(self.pl_vi), pl_idx=self.up(self.pl_idx, self.IDX), pl_k=self.up(self.pl_k),
+                     pl_I=self.up(self.pl_I), pl_L=self.up(self.pl_L, np.float64))
+        if op.series:
+            f.update(se_vi=self.up(self.se_vi), se_idx=self.up(self.se_idx, self.IDX), se_a=self.up(self.se_a),
+                     se_b=self.up(self.se_b), se_c=self.up(self.se_c), se_I=self.up(self.se_I),
+                     se_q=self.up(self.se_q), se_L=self.up(self.se_L, np.float64),
+                     se_Cinv=self.up(self.se_Cinv, np.float64))
+        if op.mur is not None:
+            f.update(m0=self.up(self.m0, self.IDX), m1=self.up(self.m1, self.IDX), mk=self.up(self.mk),
+                     o0=self.up(self.o0), o1=self.up(self.o1))
+        for key, t in (('pv', self.pv), ('pi', self.pi)):
+            if t is not None:
+                f.update({key + '_idx': self.up(t[0], self.IDX), key + '_w': self.up(t[1]),
+                          key + '_pid': self.up(t[2], self.IDX)})
+        from emsdev.vulkan import HostBuffer
+        self.hpart = HostBuffer(self.dev, 8 * (self.NBLK + 1))    # the energy's partial sums, written there
+        self._hosts = [self.hpart]
+        self.buf = self.zeros(self.buf.shape)
+        f.update(part=_Addr(self.hpart.address), buf=self.buf)
+        self.n_ex = len(op.exc[0])
+        self.n_pl = len(op.par_L) if op.par_L else 0
+        self.n_se = len(op.series) if op.series else 0
+        self.n_mu = len(op.mur[0]) if op.mur is not None else 0
+        vals = dict(nx=nx, ny=ny, nz=nz, P=self.P, ns=len(self.pml), n_ex=self.n_ex, n_pl=self.n_pl, n_se=self.n_se,
+                    n_mu=self.n_mu, n_pv=len(self.pv[0]) if self.pv is not None else 0,
+                    n_pi=len(self.pi[0]) if self.pi is not None else 0, np_=self.buf.shape[1],
+                    pml_M=self.pml_M, pad=0, kh=float(self.kh), ke=float(self.ke), dt=float(self.dtf32),
+                    dtf=float(getattr(self, 'dtf', 0.0)))
+        rec = np.zeros(1, _model_dtype(kernels_vk.MODEL))
+        for name, kind in kernels_vk.MODEL:
+            rec[name] = f[name].addr if kind == 'p' and name in f else (0 if kind == 'p' else vals[name])
+        self.model = self.up(rec.view(np.uint8))
+        self.fused = _post_disjoint(op)
+        self.mode = 'fused' if self.fused else 'separate'
+        if os.environ.get('GFDTD_STEP') in ('fused', 'split', 'separate'):
+            self.mode = os.environ['GFDTD_STEP'] if self.fused else 'separate'
+        elif self.fused and self.pml:
+            self.mode = self._pick_mode()
+
+    # ---- device memory -----------------------------------------------------------------------------------------
+    def _buffer(self, nbytes, data=None):
+        size = max(-(-int(nbytes) // 16) * 16, 16)                  # whole 16 bytes, the data padded to them
+        if data is not None and data.nbytes != size:
+            pad = np.zeros(size, np.uint8)
+            pad[:data.nbytes] = np.ascontiguousarray(data).view(np.uint8).ravel()
+            data = pad
+        try:
+            b = self.dev.create_buffer(size=size, usage=self.usage)
+        except Exception as e:                                      # past the driver's largest buffer, out of memory
+            raise MemoryError(f"gfdtd: a {nbytes / 1e9:.2f} GB GPU buffer: {e}")
+        if data is not None:
+            b.copy_from_numpy(data)
+        self._keep.append(b)
+        return b
+
+    def up(self, a, dtype=None):
+        """A host array on the device (a copy)."""
+        a = np.ascontiguousarray(np.asarray(a) if dtype is None else np.asarray(a, dtype))
+        if a.size == 0:
+            a = np.zeros(4, a.dtype)
+            return _Dev(self._buffer(16, a), 0, a.dtype)
+        return _Dev(self._buffer(a.nbytes, a), a.size, a.dtype, a.shape)
+
+    def zeros(self, shape, dtype=np.float32):
+        shape = (shape,) if np.isscalar(shape) else tuple(shape)
+        n = int(np.prod(shape))
+        d = _Dev(self._buffer(n * np.dtype(dtype).itemsize), n, dtype, shape)
+        self._clear(d)
+        return d
+
+    def _clear(self, d):
+        self._encoder().clear_buffer(d.buf)
+
+    def to_host(self, d):
+        """A device array as numpy (a host read: everything recorded so far runs first). Through mapped host memory,
+        filled by a kernel (copy_words)."""
+        if not isinstance(d, _Dev):
+            return np.asarray(d)
+        nbytes = d.n * d.dtype.itemsize
+        h = self._host_stage(nbytes)
+        self._launch('copy_words', -(-nbytes // 4), src_w=d.addr, dst_w=h.address, nw_=-(-nbytes // 4))
+        self.sync()
+        return h.array[:nbytes].view(d.dtype).reshape(d.shape).copy()
+
+    def _host_stage(self, nbytes):
+        from emsdev.vulkan import HostBuffer
+        h = getattr(self, '_stage', None)
+        if h is None or h.nbytes < nbytes:
+            if h is not None:
+                h.free()
+            h = self._stage = HostBuffer(self.dev, max(nbytes, 1 << 16))
+            self._hosts.append(h)
+        return h
+
+    def fields(self):
+        """(V, I) as numpy, for what has no kernel (dumps of Jc)."""
+        return self.to_host(self.V), self.to_host(self.I)
+
+    # ---- launches --------------------------------------------------------------------------------------------
+    def _encoder(self):
+        if self.enc is None:
+            self.enc = self.dev.create_command_encoder()
+        return self.enc
+
+    def _launch(self, name, m, **vars):
+        """Kernel `name` over m items (a grid-stride loop), recorded after a barrier on what came before."""
+        m = int(m)
+        if m <= 0:
+            return
+        groups = min((m + self.BLOCK - 1) // self.BLOCK, self.max_groups)
+        enc = self._encoder()
+        p = enc.begin_compute_pass()                                # the pass and cursor directly: half the host
+        cur = self.spy.ShaderCursor(p.bind_pipeline(self.k[name]))  # time of ComputeKernel.dispatch(vars=...)
+        cur['M'] = self.model.addr
+        cur['stride'] = groups * self.BLOCK
+        for key, v in vars.items():
+            cur[key] = v
+        p.dispatch_compute([groups, 1, 1])
+        p.end()
+        enc.global_barrier()                                        # the kernels reach memory by address: no
+                                                                    # resource tracking, so a barrier each
+        self.launches += 1
+        if self.launches >= self.batch:
+            self._submit()
+            self.batch = min(2 * self.batch, self.SUBMIT)
+
+    def _submit(self):
+        if self.enc is not None:
+            self.dev.submit_command_buffer(self.enc.finish())
+            self.enc, self.launches = None, 0
+
+    def sync(self):
+        self._submit()
+        self.dev.wait_for_idle()
+        self.batch = self.FIRST
+
+    # ---- the step --------------------------------------------------------------------------------------------
+    _pick_mode = CupyBackend._pick_mode
+
+    def step(self, sig=None, n=None):
+        """One timestep in three launches (as CupyBackend.step), or the separate kernels."""
+        if self.mode == 'separate':
+            return NumpyBackend.step(self, sig, n)
+        split = self.mode == 'split'
+        ns = 0 if split else len(self.pml)
+        self._launch('step_h', self.n + self.n_mu, ns_=ns)
+        if split:
+            self._pml('H')
+        if self.more and n is not None:
+            self.excite_more('I', n)
+        self._launch('step_e', self.n, ns_=ns)
+        if split:
+            self._pml('E')
+        if self.more and n is not None:
+            self.excite_more('V', n)
+        n_ex = self.n_ex if sig is not None else 0
+        self._launch('step_post', n_ex + self.n_pl + self.n_se + self.n_mu, n_ex_=n_ex, s_=float(sig or 0.0))
+
+    def _pml_all(self, f):
+        """The slabs concatenated for the one-launch PML kernels (as CupyBackend._pml_all), into Model's fields."""
+        self.pml_M = sum(sl['m'] for sl in self.pml)
+        if not self.pml:
+            return
+        desc, st, bo = [], 0, 0
+        for sl in self.pml:
+            desc.append([st, sl['m'], sl['axis'], 0, sl['n'], bo])
+            st, bo = st + sl['m'], bo + sl['n']
+        for F in 'EH':
+            d = np.array(desc, self.IDX)
+            d[:, 3] = [sl[F.lower() + '0'] for sl in self.pml]
+            cat = lambda k: np.concatenate([sl[k] for sl in self.pml])
+            f.update({'psi' + F: self.zeros(2 * self.pml_M), 'b' + F: self.up(cat('b' + F)),
+                      'c' + F: self.up(cat('c' + F)), 'k1' + F: self.up(cat(f'k{F}1')),
+                      'k2' + F: self.up(cat(f'k{F}2')), 'desc' + F: self.up(d.ravel(), self.IDX)})
+            lo, hi = [0, 0, 0], list(self.op.shape)                 # the PML-free interior: lines [lo, hi) per axis
+            for sl in self.pml:
+                a, s0 = sl['axis'], sl[F.lower() + '0']
+                if sl['hi']:
+                    hi[a] = min(hi[a], s0)
+                else:
+                    lo[a] = max(lo[a], s0 + sl['n'])
+            f['box' + F] = self.up(np.array(lo + hi, np.int32))
+
+    def _pml(self, field):
+        self._launch('pml_e' if field == 'E' else 'pml_h', self.pml_M)
+
+    def update_H(self):
+        self._launch('update_h', self.n)
+
+    def update_E(self):
+        self._launch('update_e', self.n)
+
+    def mur_pre(self):
+        self._launch('mur_pre', self.n_mu)
+
+    def mur_post(self):
+        self._launch('mur_post', self.n_mu)
+
+    def excite(self, s):
+        self.add(self.V, self.exc_idx, self.exc_amp, s)
+
+    def add(self, F, idx, amp, val):
+        self._launch('excite', len(idx), F_=F.addr, idx_=idx.addr, amp_=amp.addr, s_=float(val), m_=len(idx))
+
+    def assign(self, F, idx, amp, val):
+        self._launch('assign', len(idx), F_=F.addr, idx_=idx.addr, amp_=amp.addr, s_=float(val), m_=len(idx))
+
+    def lumped(self):
+        self._launch('par_l', self.n_pl)
+        self._launch('series_rlc', self.n_se)
+
+    def probe(self, slot):
+        """One sample into buffer row slot (rows are zeroed after each fetch)."""
+        self._launch('probe', self.np_terms, slot_=int(slot))
+
+    @property
+    def np_terms(self):
+        return (len(self.pv[0]) if self.pv is not None else 0) + (len(self.pi[0]) if self.pi is not None else 0)
+
+    def energy(self):
+        """The field's and the lumped branches' energy (one host read)."""
+        self._launch('energy', self.NBLK * self.BLOCK, nblk_=self.NBLK)
+        self.sync()
+        p = self.hpart.view(np.float64, self.NBLK + 1)
+        return float(p[:self.NBLK].sum() * (self.op.dt / 2) + p[self.NBLK] / 2)
+
+    def fetch(self, n):
+        rows = self.to_host(self.buf)[:n].astype(float)
+        self._clear(self.buf)
+        return rows
+
+    # ---- dumps (dumps.Region on the GPU) ---------------------------------------------------------------------
+    def dump_kernel(self, region, out, nf, t):
+        a = region.args
+        self._launch('dump', int(np.prod(region.shape)) * 3, field_=int(a[0]), cell_=int(a[1]), lx_=int(a[2]),
+                     ly_=int(a[3]), lz_=int(a[4]), sx_=int(a[5]), sy_=int(a[6]), sz_=int(a[7]), nf_=int(nf),
+                     omega_=region.omega.addr, tm_=float(t), dst_=out.addr)
+
+
+class _Addr:
+    """A device address as Model's fields take it (mapped host memory)."""
+    def __init__(self, addr):
+        self.addr = addr
+
+
+def _model_dtype(fields):
+    return np.dtype([(n, '<u8' if k == 'p' else ('<i4' if k == 'i' else '<f4')) for n, k in fields])
+
+
+_vk_local = None
+
+
+def _vk_kernels(dev, ctype, block, idx='int'):
+    """The Vulkan kernels' pipelines for a device and code type, compiled once per thread (as the device: emsdev's
+    slang_device is one per thread; slangpy keeps the SPIR-V on disk too). Kept thread-local, so that a thread's
+    device and pipelines go with it."""
+    global _vk_local
+    import threading
+    from . import kernels_vk
+    if _vk_local is None:
+        _vk_local = threading.local()
+    cache = getattr(_vk_local, 'cache', None)
+    if cache is None:
+        cache = _vk_local.cache = {}
+    key = (id(dev), ctype, block, idx)
+    if key not in cache:
+        mod = dev.load_module_from_source(f"gfdtd_{ctype}_{block}_{idx}", kernels_vk.source(ctype, block, idx))
+        cache[key] = (dev, {n: dev.create_compute_pipeline(dev.link_program([mod], [mod.entry_point(n)]))
+                            for n in kernels_vk.NAMES})
+    return cache[key][1]
+
+
+def _post_disjoint(op):
+    """Whether the post kernel may run the excitation, lumped and Mur entries at once: their edges disjoint (and
+    Mur's inner edges apart from the others)."""
+    sets = [np.asarray(op.exc[0]), np.array([e for e, _ in op.par_L], np.int64),
+            np.array([e[0] for e in op.series], np.int64)]
+    mur = [op.mur[0], op.mur[1]] if op.mur is not None else []
+    flat = np.concatenate([np.unique(x) for x in sets] + [np.unique(np.concatenate(mur))] if mur else
+                          [np.unique(x) for x in sets])
+    dup = len(np.unique(flat)) < len(flat) or len(set(e for e, _ in op.par_L)) < len(op.par_L) or \
+        len(set(e[0] for e in op.series)) < len(op.series)
+    return not dup
+
 
 def make_backend(op, backend='auto', dtype=np.float32):
     name = resolve_backend(backend)
-    return {'cupy': CupyBackend, 'core': CoreBackend, 'numpy': NumpyBackend}[name](op, dtype)
+    return {'cupy': CupyBackend, 'vulkan': VulkanBackend, 'core': CoreBackend, 'numpy': NumpyBackend}[name](op, dtype)
 
 
 def _fmt_t(s):
