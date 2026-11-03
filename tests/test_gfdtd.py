@@ -189,6 +189,27 @@ def test_operator_metal_edges_and_dielectric_average(tmp_path):
     assert [(sl['axis'], sl['hi'], sl['n']) for sl in op.pml] == [(1, 0, 4)]   # ymin PML_8: 4 of the 5 cells
 
 
+def test_material_of_higher_priority_takes_the_metal_edges():
+    """As in openEMS, the property of the highest priority at an edge's midpoint decides: a bore of a material above
+    the metal's priority drilled through a metal block leaves the edges in it free; a material below stays metal."""
+    F = openEMS()
+    F.SetGaussExcite(2e9, 1e9)
+    F.SetBoundaryCond(['PEC'] * 6)
+    csx = ContinuousStructure()
+    F.SetCSX(csx)
+    g = csx.GetGrid()
+    g.SetDeltaUnit(1e-3)
+    for a in 'xyz':
+        g.SetLines(a, np.arange(0, 4.01, 0.5))
+    csx.AddMetal('block').AddBox([0.5, 0.5, 0.5], [3.5, 3.5, 3.5], priority=5)
+    csx.AddMaterial('bore', epsilon=2.1).AddCylinder([2, 2, 0], [2, 2, 4], 0.6, priority=10)
+    csx.AddMaterial('paint', epsilon=3.0).AddBox([0, 0, 3.5], [4, 4, 4], priority=1)
+    pec = build(csx, F.settings()).pec_mask
+    assert not pec[2, 4, 4, 1:7].any() and not pec[0, 3, 4, 4]     # in the bore: z edges on its axis, an x edge
+    assert pec[2, 2, 4, 1:7].all() and pec[0, 2, 2, 4]              # in the block, 1 mm from the axis
+    assert pec[0, 2, 2, 7]                                          # the block's top face, under the paint
+
+
 def _load_s11(tmp_path, backend='numpy', fill=None, **el):
     """S11 of a port between two small plates, loaded at their far edge by a lumped element (none: open); PEC box.
     fill(csx): adds a material between the plates."""
