@@ -1,17 +1,17 @@
 # gfdtd
 
-A 3D FDTD solver in the manner of openEMS that runs on a GPU (Vulkan through slangpy: any GPU with a Vulkan
-driver, Windows or Linux; or CuPy: NVIDIA CUDA or AMD ROCm), or on the CPU through a compiled core, with numpy as the fallback and the reference. It reads openEMS's models: a script
-written for openEMS's Python interface runs here by swapping two imports, and `gfdtd model.xml` runs an openEMS
-XML file as `openEMS model.xml` does. Neither openEMS nor CSXCAD needs to be installed.
+A 3D FDTD solver in the manner of openEMS that runs on a GPU (Vulkan through slangpy on any GPU, or CuPy on NVIDIA
+CUDA or AMD ROCm), or on the CPU through a compiled core, with numpy as the fallback and the reference. It reads
+openEMS's models: a script written for openEMS's Python interface runs here by swapping two imports, and
+`gfdtd model.xml` runs an openEMS XML file as `openEMS model.xml` does. Neither openEMS nor CSXCAD needs to be
+installed.
 
-On one mid-range GPU gfdtd runs 8–20 times faster than openEMS on a 24-thread CPU; its CPU core, on that same
-CPU, about twice as fast, and five times with PML and wideband dielectrics (see [Speed](#speed)). It was written
-as a solver for [kicad2ems](https://github.com/lowprocess/kicad2ems) (KiCad boards to S-parameters, `--solvers
-gfdtd`), which builds openEMS's model of a board and runs it here. The connection lives in
-[kicad2ems-fdtd](https://github.com/lowprocess/kicad2ems-fdtd), with openEMS's; gfdtd itself knows nothing of
-kicad2ems. What kicad2ems-fdtd may rely on is versioned: `gfdtd.API_VERSION` (its docstring lists it), checked
-there.
+On one mid-range GPU gfdtd runs 8–20 times faster than openEMS on a 24-thread CPU; its CPU core about twice as
+fast, and five times with PML and wideband dielectrics ([Speed](#speed)). It was written as a solver for
+[kicad2ems](https://github.com/lowprocess/kicad2ems) (`--solvers gfdtd`), which builds openEMS's model of a board
+and runs it here; the connection lives in [kicad2ems-fdtd](https://github.com/lowprocess/kicad2ems-fdtd), and gfdtd
+itself knows nothing of kicad2ems. What kicad2ems-fdtd may rely on is versioned: `gfdtd.API_VERSION` (its
+docstring lists it).
 
 ## Install
 
@@ -23,20 +23,16 @@ pip install '.[core]'               # pybind11, then build the CPU core (g++ wit
 python -m gfdtd.core.build          # src/gfdtd/_core*.so; GFDTD_ARCH=-march=x86-64-v3 for a portable build
 ```
 
-The CuPy extras conflict: install one. The CUDA wheels need the NVIDIA driver; the ROCm wheel the ROCm 7 runtime
-(Linux only: CuPy has no ROCm wheel for Windows). The Vulkan backend needs only the GPU's driver (Vulkan 1.2 with
-buffer device addresses and float32 atomic adds: every desktop GPU of the last several years) and slangpy; it runs
-the same update code as CuPy's, at the same speed on an RX 7800 XT ([Speed](#speed)).
-Without the core the CPU runs on numpy, some 15 times slower. The backend is picked per run (`backend='auto'`:
-a Vulkan GPU, else CuPy's, else the core, else numpy, CuPy first only where it runs on CUDA; `gpu`: the same
-without the CPU);
-`GFDTD_BACKEND=cupy|vulkan|core|numpy` overrides it for every run, `EMSDEV_VULKAN_DEVICE=1` picks the second
-Vulkan GPU.
+The CuPy extras conflict: install one (ROCm on Linux only). Vulkan needs only the GPU's driver (Vulkan 1.2 with
+buffer device addresses and float32 atomic adds: any desktop GPU of the last several years). Without the core the
+CPU runs on numpy, some 15 times slower. Each run picks its backend (`backend='auto'`: a Vulkan GPU, else CuPy's,
+else the core, else numpy; CuPy before Vulkan where it runs on CUDA); `GFDTD_BACKEND=cupy|vulkan|core|numpy`
+overrides it, `EMSDEV_VULKAN_DEVICE=1` picks the second Vulkan GPU.
 
 ## CSXCAD and openEMS compatibility
 
 gfdtd reads and writes openEMS's XML files and has the part of the CSXCAD / openEMS Python interface that
-openEMS scripts use, so a model built for openEMS runs on gfdtd too:
+openEMS scripts use:
 
 ```python
 from gfdtd import ContinuousStructure, openEMS        # in place of CSXCAD's and openEMS's
@@ -55,11 +51,10 @@ ff = nf.CalcNF2FF(sim_path, [2.4e9], theta, phi)      # ff.Dmax, ff.Prad, ff.E_n
 gfdtd model.xml --path run/        # an openEMS XML file (FDTD.Write2XML), as `openEMS model.xml`
 ```
 
-A run writes what openEMS writes, in openEMS's formats: its status lines (`[@ 4s] Timestep: ... || Speed: ...
-|| Energy: ...`), the probe files `port_ut_N` / `port_it_N`, the excitation `et` and the field dumps
-(`<name>_<step>.vtr` frames, `<name>.h5`). A file `ABORT` in the
-run folder ends a run. So tools written for openEMS's run folders (kicad2ems's progress lines, port watch,
-Stop and S-parameter code among them) work on gfdtd unchanged.
+A run writes what openEMS writes, in openEMS's formats: its status lines, the probe files `port_ut_N` /
+`port_it_N`, the excitation `et` and the field dumps (`.vtr` frames, `.h5`); a file `ABORT` in the run folder ends
+it. So tools written for openEMS's run folders (kicad2ems's progress lines, port watch, Stop and S-parameter code
+among them) work on gfdtd unchanged.
 
 ## What it models
 
@@ -81,15 +76,14 @@ Stop and S-parameter code among them) work on gfdtd unchanged.
 | End | the energy in the field and in the lumped parts (`EndCriteria`), timestep limit, `ABORT` |
 
 Not yet: conductor loss (`--sigma`: conducting sheets run as PEC), Lorentz materials, time-domain NF2FF,
-`--converge`, the mode-purity column of
-mode-matching probes, field probes (types 2, 3), and cylindrical grids. A file that holds these is still read:
-what gfdtd doesn't model is listed as a note.
+`--converge`, the mode-purity column of mode-matching probes, field probes (types 2, 3), and cylindrical grids. A
+file that holds these is still read: what gfdtd doesn't model is listed as a note.
 
 <a id="ports"></a>
 ## Ports
 
-`gfdtd.ports` has openEMS's Python port classes, made as openEMS makes them (the same metal, probes and
-excitations, the same post-processing), and `openEMS` has their `Add...Port` methods:
+`gfdtd.ports` has openEMS's Python port classes, made as openEMS makes them (the same metal, probes, excitations
+and post-processing), and `openEMS` has their `Add...Port` methods:
 
 ```python
 port = FDTD.AddMSLPort(1, metal, start, stop, 'x', 'z', excite=-1, FeedShift=10, MeasPlaneShift=30)
@@ -103,9 +97,8 @@ port = FDTD.AddCurvePort(1, 50, start, stop, excite=1)
 ```
 
 The transmission-line ports take the line's impedance and propagation constant from three voltage and two current
-probes along it; the waveguide ports match the field on the port plane to the mode (mode-matching probes, at the
-nodes for E and the cells for H, normalised as openEMS's) and take the impedance from the mode's cutoff. Small
-models on both engines (largest |S| difference over the band; the same model built through either API):
+probes along it; the waveguide ports match the field on the port plane to the mode and take the impedance from the
+mode's cutoff. Small models on both engines (largest |S| difference over the band):
 
 | Port | Model | ΔS11 | ΔS21 |
 |---|---|---|---|
@@ -116,12 +109,8 @@ models on both engines (largest |S| difference over the band; the same model bui
 | curve | a microstrip line between two curve ports | 0.008 | 0.010 |
 | CPW (lumped ports across one gap) | no ground plane, 6 mm of air past the ends | 0.004 | 0.004 |
 
-With the strips running into the Mur walls instead (the board's ends at the boundary), the two engines part by
-up to 0.1 in S11 on the open CPW: they treat metal at an absorbing wall differently. kicad2ems keeps air
-between the board and the boundary, so it doesn't meet this.
-
-Before these ports, a current probe whose normal was y ran its loop the wrong way round (the current came out
-negated, |S11| near 95 for a lumped port along y); x and z were right, which is why no example showed it.
+With the strips running into the Mur walls instead, the two engines part by up to 0.1 in S11 on the open CPW: they
+treat metal at an absorbing wall differently. kicad2ems keeps air between the board and the boundary.
 
 ## How it works
 
@@ -140,103 +129,69 @@ V   = vv * V + vi * (loop sum of I around the dual face)  from C = eps A' / l, G
 - **Lumped elements** spread R, L and C over the edges in their box, weighted by each column's share of
   the width. Parallel L and series RLC are branch currents on their edges.
 - **Debye poles:** each pole is a polarisation current on its edges, tau di/dt + i = C_p dV/dt
-  (C_p = eps0 eps_delta A′ / l, averaged like epsilon). It is integrated with the trapezoidal rule at the E
-  update's time, which folds part of it into vv and vi: stable for any tau.
-- **PML:** CPML (kappa 1, no alpha) with a cubic grading and R0 = 1e-6 over the PML_n cells. Each slab keeps
-  two auxiliary terms per field along its axis; corners take both slabs' terms. The grading is the stretched
-  coordinate's, the same for E and H, so the PML matches any dielectric that runs into it.
-- **Dumps** are at the cell centres, on the cells openEMS's dump mode 2 picks (the box snapped to lines s0..s1,
-  then the cells s0-1..s1), or at the nodes (modes 0, 1), sampled with the probes. The frequency domain is a
-  running DFT on the device: 2 dt_s sum F(t) exp(-j w t), as openEMS's.
-- **Far field** (`src/gfdtd/nf2ff.py`): the NF2FF box records E and H at the nodes of its six faces (as openEMS's,
-  inside a Mur side's 2 lines or a PML_n side's n + 1; no face on a PEC / PMC side, which mirrors instead). The
-  faces carry J = n x H and M = -n x E. On a planar face the phase e^(jk r.r') is a product over its two axes,
-  so the radiation integrals are matrix products. Prad is the flux through the faces, 1/2 Re sum (E x H*).n,
-  and Dmax = 4 pi r^2 max(S) / Prad, as openEMS's. The result file is openEMS's, which its `nf2ff_results` and
-  kicad2ems's GUI read.
+  (C_p = eps0 eps_delta A′ / l, averaged like epsilon), integrated with the trapezoidal rule at the E update's
+  time, which folds part of it into vv and vi: stable for any tau.
+- **PML:** CPML (kappa 1, no alpha) with a cubic grading and R0 = 1e-6 over the PML_n cells; corners take both
+  slabs' terms. The grading is the stretched coordinate's, the same for E and H, so the PML matches any
+  dielectric that runs into it.
+- **Dumps** are at the cell centres, on the cells openEMS's dump mode 2 picks, or at the nodes (modes 0, 1). The
+  frequency domain is a running DFT on the device, as openEMS's.
+- **Far field** (`src/gfdtd/nf2ff.py`): the NF2FF box records E and H at the nodes of its six faces (as openEMS's;
+  no face on a PEC / PMC side, which mirrors instead), as J = n x H and M = -n x E. On a planar face the phase is
+  a product over its two axes, so the radiation integrals are matrix products. Prad and Dmax are openEMS's, and
+  so is the result file.
 - **Time step:** the stability limit of the rectilinear grid (the shortest neighbouring cells around each
-  node), times 0.95. That is about 10 % shorter than openEMS's Rennings step.
+  node), times 0.95: about 10 % shorter than openEMS's.
 
-The engine (`src/gfdtd/engine.py`) is a Python time loop over one backend. The GPUs (CuPy, Vulkan) and the CPU core
-run the same update code (`src/gfdtd/core/fdtd_core.h`) on the **compressed operator**:
+The engine (`src/gfdtd/engine.py`) is a Python time loop over one backend. The GPUs and the CPU core run the same
+update code (`src/gfdtd/core/fdtd_core.h`) on a **compressed operator**: no coefficient arrays. iv is geometry,
+from three line arrays; vv and vi's per-edge factor come from a table through one code per node (8 bits, or 16 /
+32 past 255 / 65535 codes), all nodes of one material or interface mix sharing a code (the example boards need
+40–60). That cuts a cell update from 108 to 73 bytes of memory traffic. The Debye poles are folded into the E
+update, their currents stored only where there are poles. The table is exact to 2^-20.
 
-- There are no coefficient arrays. iv is pure geometry, dt dual_a / (mu d_b d_c), from three line arrays. vi is
-  that geometry times a per-edge factor s. vv and s come from a table through one code per node, covering its
-  three E edges: 8 bits, or 16 / 32 past 255 / 65535 codes. All nodes of one material (or one quarter-cell mix
-  at an interface) share a code; the example boards need 40–60. This cuts each cell update from 108 to 73 bytes
-  of memory traffic.
-- The **Debye poles** are folded into the E update: one pass, no extra kernels. The pole currents are stored
-  only for the nodes that have them, scaled so that their coefficients don't depend on the geometry either.
-- The table is exact to 2^-20 (vv and s are rounded so that equal values match).
-
-The four backends:
-
-- **CuPy** (`src/gfdtd/kernels.py`): one thread per node, in blocks of 128. The same source compiles for ROCm
-  through hiprtc. Fields are float32. A timestep is three launches:
-  - `step_h`: H, the node's PML terms and the Mur copies.
-  - `step_e`: E with the Debye poles and the node's PML terms.
-  - `step_post`: the excitation, lumped branches and Mur update, together. Their edges must be disjoint, which
-    is checked at setup; otherwise they run as separate kernels.
-
-  With PML, the backend first times the PML inside the two kernels against one launch of its own per field, and
-  keeps the faster. The trial steps don't change the zero fields. Inside wins on small and large models; at
-  ~1 M cells (cache-resident) the bigger kernels' occupancy matters more. Nodes are decoded in 32-bit
-  arithmetic, since the GPU emulates 64-bit division (up to 715 M nodes). A dump box is one kernel per sample
-  that interpolates and adds the DFT term. Probe samples stay on the device. Excitations run in threads, each on
-  its own stream, as many at once as fit in the GPU's cache together (`concurrent_runs`: up to 1.2 M cells in
-  all; `--jobs` or `GFDTD_CONCURRENT_CELLS` set it).
-- **Vulkan** (`src/gfdtd/kernels_vk.py`, slangpy): the same kernels in Slang, around the same `fdtd_core.h`, which
-  Slang reads as it is (no `const` on its pointers, `GF_TEMPLATE` for the code type: the header's top says
-  what differs). Compiled to SPIR-V when a run starts (cached on disk by slangpy), and run on any Vulkan GPU
-  through Vulkan's buffer device addresses: each kernel reaches the model through one struct of addresses in
-  GPU memory, so a launch sets a pointer and a few values. 32-bit indices, 64 threads a workgroup (1-4 % faster
-  than 128 or 256 on the RX 7800 XT). The same three-launch step, fused or split as CuPy's, the same PML trial,
-  recorded into command buffers of 96 launches that the GPU runs while the host records the next (about 2.5 µs
-  of host time a launch). The energy is summed in double per workgroup on the GPU and the partial sums on the
-  host (RDNA has no float64 atomics in Vulkan). Runs in threads get a Vulkan device each, so they overlap too.
+- **CuPy** (`src/gfdtd/kernels.py`, CUDA or ROCm through hiprtc): one thread per node, in blocks of 128, float32.
+  A timestep is three launches: `step_h` (H, its PML terms, the Mur copies), `step_e` (E with the Debye poles and
+  PML terms) and `step_post` (the excitation, lumped branches and Mur update, whose edges must be disjoint). With
+  PML, a trial at setup picks the PML inside those kernels or in launches of their own. Excitations run in
+  threads, a stream each, as many at once as fit in the GPU's cache (`concurrent_runs`: up to 1.2 M cells in all;
+  `--jobs` or `GFDTD_CONCURRENT_CELLS` set it).
+- **Vulkan** (`src/gfdtd/kernels_vk.py`, slangpy): the same kernels in Slang around the same `fdtd_core.h`, compiled
+  to SPIR-V when a run starts (cached by slangpy). Each kernel reaches the model through one struct of buffer
+  device addresses; 32-bit indices, 64 threads a workgroup; the same three launches and PML trial, recorded into
+  command buffers of 96 launches the GPU runs while the host records the next. The energy is summed in double per
+  workgroup on the GPU and the partial sums on the host. Runs in threads get a Vulkan device each.
 - **core** (`src/gfdtd/core/gfdtd_core.cpp`, pybind11 and OpenMP): rows along z with the boundary tests outside the
-  loops, so that the compiler vectorises them; Mur and PML too. Denormals are flushed to zero while it runs
-  (the GPU does this anyway). Before that, the tiny fields ahead of the first wave ran the first few thousand
-  steps 5–10 times slower. It runs one thread per physical core of the fastest kind: the performance cores of
-  a hybrid CPU, no hyper-threads. On the i7-13700K that is 8 threads. On an idle machine 8 and all 24 run the
-  example boards within 10 % of each other. With the desktop and a browser running, 24 threads were 2–4 times
-  slower on the hairpin: every barrier waits for the slowest thread, and any busy core holds it up. 8 leave
-  room. `--threads` or `OMP_NUM_THREADS` set it.
-- **numpy**: the dense coefficient arrays as array slices. It is slow, and it is the reference the other two
-  are tested against (1e-6).
+  loops, so the compiler vectorises them, and denormals flushed to zero. It runs one thread per physical core of
+  the fastest kind (8 on an i7-13700K): every barrier waits for the slowest thread, and with the desktop busy, 24
+  threads ran 2–4 times slower. `--threads` or `OMP_NUM_THREADS` set it.
+- **numpy**: the dense coefficient arrays as array slices: slow, and the reference the others are tested against
+  (1e-6).
 
-Probe samples stay on the device and are written out in chunks. The energy is checked every 100 timesteps,
-one host synchronisation each: the field's, and the lumped parts' (L I²/2 in an inductor, q²/2C in a series
-capacitor). A filter of lumped parts rings in them, and on the field's energy alone its runs had ended early.
+Probe samples stay on the device and are written out in chunks. The energy is checked every 100 timesteps: the
+field's and the lumped parts' (L I²/2, q²/2C), since a filter of lumped parts rings in them.
 
 ## Accuracy and speed
 
-The board comparisons below were run through kicad2ems (`--solvers openems,gfdtd`: the same model and mesh on both
-engines); its flags name the settings.
+Through kicad2ems (`--solvers openems,gfdtd`: the same model and mesh on both engines):
 
 **PML, Debye, dumps.** A microstrip on a strongly dispersive substrate (eps_inf 3, one pole of 1.5 at 30 ps), PML
-on five sides. Debye is checked against a plain material of the same complex epsilon at 5 GHz, where the two
-must agree: gfdtd's Debye run gives S21 −4.240 dB / 40.9°, its plain run −4.235 dB / 41.0°, and openEMS's plain
-run −4.234 dB / 41.2°. openEMS's own Debye run gives −4.744 dB / 36.8° there, 0.5 dB more loss than its plain
-material. The PML agrees with openEMS's PML to 0.02 in S11 and 0.005 in S21. In the tests, a radial wave
-through an 8-cell PML is within 5e-5 of the peak of a reflection-free reference, against 6 % for Mur. Dump
-grids are openEMS's exactly. Values agree within ~3 %, of which 1.8 % is the incident wave itself (the maps
-are scaled to 1 V incident).
+on five sides, against a plain material of the same complex epsilon at 5 GHz: gfdtd's Debye run gives S21
+−4.240 dB / 40.9°, its plain run −4.235 dB / 41.0°, openEMS's plain run −4.234 dB / 41.2° (openEMS's own Debye run
+−4.744 dB / 36.8°, 0.5 dB more loss). The PML agrees with openEMS's to 0.02 in S11 and 0.005 in S21; a radial wave
+through an 8-cell PML is within 5e-5 of a reflection-free reference (Mur: 6 %). Dump grids are openEMS's exactly,
+the values within ~3 %. rf_coupler with `--bc PML_8 --diel wideband --dump ...`: max |ΔS| 0.004 against openEMS,
+which took 235 s; gfdtd 11 s on the GPU and 49 s on the CPU core (1.27 M cells).
 
-rf_coupler with `--bc PML_8 --diel wideband --dump ...`: max |ΔS| 0.004 against openEMS. openEMS took 235 s;
-gfdtd took 11 s on the GPU and 49 s on the CPU core (1.27 M cells).
-
-**Antenna mode.** examples/antenna_dipole.toml, `--solvers openems,gfdtd`. Both find resonance at 2.435 GHz:
-S11 −20.7 dB (openEMS) and −21.0 dB (gfdtd); Zin 62.8 + j7.3 and 63.0 + j6.8 ohm. From 1.9 to 3.1 GHz
-directivity agrees within 0.02 dB and efficiency within 1 %; the pattern cuts within 0.05 dB. openEMS took 13 s,
-gfdtd 1 s. At the band edges gfdtd needs a deeper end criterion. Its fields decay faster, so the default ends
-the run while the far field's low end is still settling: with `--end-db -60 --end-on energy` it gives 73.3 %
-efficiency at 1.5 GHz against openEMS's 74.1 %. On a half-wave dipole in free space (the tests) gfdtd gives
-2.16 dBi and 100.1 % efficiency; openEMS 2.17 dBi and 100.0 %.
+**Antenna mode.** `examples/antenna_dipole.toml`: both resonate at 2.435 GHz, S11 −20.7 dB (openEMS) and −21.0 dB,
+Zin 62.8 + j7.3 and 63.0 + j6.8 ohm; from 1.9 to 3.1 GHz directivity agrees within 0.02 dB, efficiency within 1 %
+and the pattern cuts within 0.05 dB. openEMS took 13 s, gfdtd 1 s. Its fields decay faster, so at the band's edges
+it wants a deeper end criterion (`--end-db -60 --end-on energy`: 73.3 % efficiency at 1.5 GHz against openEMS's
+74.1 %). A half-wave dipole in free space (the tests): 2.16 dBi and 100.1 % (openEMS 2.17 dBi, 100.0 %).
 
 <a id="speed"></a>
-**Default settings.** `--solvers openems,gfdtd` on the examples. openEMS 0.37 used 24 threads on an i7-13700K;
-gfdtd ran on an AMD RX 7800 XT (ROCm 7, float32), and its CPU core on the i7. Both engines used the same mesh.
+**Default settings**, on kicad2ems's examples: openEMS 0.37 on 24 threads of an i7-13700K, gfdtd on an AMD RX 7800
+XT (ROCm 7, float32) and its CPU core on the i7, on the same mesh:
 
 | Example | Cells | max \|ΔS\| | openEMS | gfdtd GPU | gfdtd CPU core |
 |---|---|---|---|---|---|
@@ -245,60 +200,24 @@ gfdtd ran on an AMD RX 7800 XT (ROCm 7, float32), and its CPU core on the i7. Bo
 | demo_lowpass (L, C parts) | 0.18 M | 0.03 | 70 s | 1 s | 4 s |
 | hairpin (high-Q filter) | 0.29 M | 0.02 | 49 s | 6 s | 25 s |
 
-On demo_lowpass, openEMS's field energy stalled above `--end-db`, and the port watch ended its run after
-205,000 timesteps. gfdtd's energy, the lumped parts' included, fell to −40 dB after 26,900 timesteps. The CPU
-core's S-parameters are the GPU's within 1e-6.
+On demo_lowpass openEMS's field energy stalled above `--end-db` (its port watch ended the run after 205,000
+timesteps) while gfdtd's, the lumped parts' included, fell to −40 dB after 26,900. The CPU core's S-parameters are
+the GPU's within 1e-6.
 
-**The engine alone** (`python tools/bench.py`): a microstrip on a Debye substrate, PML (or Mur) on five
-sides, per timestep, in M cell updates per second. "First version" is the dense-coefficient GPU engine with PML:
+**The engine alone** (`python tools/bench.py`; `python tools/readme_figure.py` draws this):
 
-| Cells | GPU, first version | GPU, PML | GPU, Mur | CPU core, PML / Mur | numpy |
-|---|---|---|---|---|---|
-| 0.1 M | 1,095 | 2,830 | 4,630 | 310 / 490 | 49 |
-| 1 M | 4,040 | 6,480 | 9,120 | 700 / 830 | 52 |
-| 4 M | 2,500 | 5,190 | 5,360 | 485 / 780 | – |
-| 16 M | 2,670 | 5,690 | 5,510 | 485 / 620 | – |
+![M cell updates per second against the model's size, for each backend](docs/speed.png)
 
-Both compiled backends are bound by memory bandwidth on large models: the GPU moves ~420 GB/s of its 624 GB/s
-over a whole step (73 bytes per cell update), the core ~45 GB/s of DRAM. Up to ~1 M cells the fields fit in
-the GPU's 64 MB Infinity Cache and the CPU's 30 MB L3, hence the faster middle rows.
+Both compiled backends are bound by memory bandwidth on large models: the GPU moves ~420 GB/s of its 624 GB/s over
+a step (73 bytes a cell update), the core ~45 GB/s of DRAM. Up to ~1 M cells the fields fit in the GPU's 64 MB
+Infinity Cache and the CPU's 30 MB L3. Vulkan runs kernel for kernel as fast as CuPy; on small models it loses the
+barrier between launches (about 7 µs each through slangpy, against a HIP stream's gaps).
 
-What each change gave on the GPU, measured on the benchmark (fused against the same step in separate kernels):
-
-| Change | Gain |
-|---|---|
-| Coefficients compressed, Debye in the E update | 1.26× at 1 M, 1.5× at 4–16 M cells (PML) |
-| One code per node, 8-bit (73 instead of 78 bytes) | 4–8 % on large models, none on small |
-| The step in three launches (Mur, excitation, lumped parts) | 1.45× at 0.1 M, 1.2× at 0.3 M cells, ~1 % past 4 M (Mur) |
-| The PML inside the H / E kernels | 1.25× at 0.1 M and at 4–16 M cells; at 0.3–1 M the PML stays its own launch (the setup trial picks) |
-| 32-bit node decoding, blocks of 128 | 4–8 % |
-| Excitations side by side (threads, a stream each) | 1.2–1.46× in all for 2–4 runs of 0.1–0.6 M cells; rf_diffvia's 2 runs 1.25× |
-| A dump box in one kernel per sample | the far-field box's cost per step from ~38 to ~2 µs (antenna_dipole: 67 µs per step without it) |
-
-**Vulkan against CuPy** on the same card (RX 7800 XT, RADV against ROCm 7; `tools/bench.py`, ms per step, the
-engine's own step):
-
-| Cells | CuPy, PML | Vulkan, PML | CuPy, Mur | Vulkan, Mur |
-|---|---|---|---|---|
-| 0.29 M | 0.065 | 0.066 | 0.043 | 0.049 |
-| 0.97 M | 0.148 | 0.153 | 0.105 | 0.106 |
-| 3.96 M | 0.765 | 0.802 | 0.723 | 0.750 |
-| 15.78 M | 2.768 | 2.735 | 2.840 | 2.869 |
-
-Kernel for kernel Vulkan is as fast or faster; what it loses on small models is the barrier between launches
-(about 7 µs each through slangpy's global barrier, against the launch gaps of a HIP stream). What the Vulkan
-backend's choices gave: one thread per node and 64 a workgroup (a grid of 524 k threads ran 10 % slower), 32-bit
-indices (2-7 %), launching through the compute pass directly (2.5 µs of host time a launch, against 10 µs through
-`ComputeKernel.dispatch`), a short first command buffer after each energy check (8.0 to 7.6 s on the hairpin).
-
-Tried and left out:
-
-- **Marching along x** (a thread per (y, z) column): +12 % at 1 M cells, −16 % at 4–16 M.
-- **A graph of the step's kernels, or a compiled host loop:** 2–8 %. Python issues a step's launches faster
-  than the GPU runs them.
-- **More runs at once than the cache holds:** 2 runs of 1.5 M cells ran at 0.64× of one.
-- **Temporal blocking** (several steps per tile in cache): not tried. It would be the next step for large
-  models, but every extension (probes, Mur, lumped parts, excitations, dumps) would have to work tile by tile.
+Tried and left out: marching along x (a thread per (y, z) column: +12 % at 1 M cells, −16 % at 4–16 M); a graph of
+the step's kernels or a compiled host loop (2–8 %: Python issues the launches faster than the GPU runs them); more
+runs at once than the cache holds (2 runs of 1.5 M cells at 0.64× of one). Temporal blocking (several steps per
+tile in cache) would be the next step for large models, but every extension (probes, Mur, lumped parts,
+excitations, dumps) would have to work tile by tile.
 
 ## Files
 
@@ -320,4 +239,5 @@ tests/test_gfdtd_ports.py    the ports, weighted / hard / H / delayed excitation
                              curves, current-probe snapping
 tests/openems_files.py       readers of the openEMS files a run writes, for the tests
 tools/bench.py               the engine's per-operation timings by backend and model size
+tools/readme_figure.py       the speed figure above
 ```
