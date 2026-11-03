@@ -175,7 +175,7 @@ class openEMS:                                                       # noqa: N80
         has a stream of its own, so that runs in several threads overlap."""
         from . import __version__
         from .operator import build
-        from .engine import Engine, resolve_backend, gpu_info, core_info
+        from .engine import Engine, resolve_backend, backend_info
         with contextlib.ExitStack() as stack:
             if log is None:
                 out = lambda line: print(line, flush=True)
@@ -201,7 +201,7 @@ class openEMS:                                                       # noqa: N80
             eng = Engine(self.op, backend or self.backend)
             if eng.be.name == 'core' and int(kw.get('numThreads') or 0) > 0:
                 eng.be.core.set_threads(int(kw['numThreads']))
-            out(f"Engine: {eng.be.name}" + {'cupy': f" ({gpu_info()[1]})", 'core': f" ({core_info()[1]})"}.get(eng.be.name, ''))
+            out(f"Engine: {eng.be.name}" + (f" ({backend_info(eng.be.name)})" if eng.be.name != 'numpy' else ''))
             if not setup_only:
                 self.result = eng.run(sim_path, self.nr_ts, self.end_crit, verbose=1 if verbose is None else verbose,
                                       out=out)
@@ -259,12 +259,13 @@ class LumpedPort(P.Port):
 
 
 def main(argv=None):
-    """python -m gfdtd model.xml [--backend auto|cupy|numpy] [--path DIR]: run an openEMS XML file (outputs in the
+    """python -m gfdtd model.xml [--backend auto|gpu|cupy|vulkan|cpu|numpy] [--path DIR]: run an openEMS XML file (outputs in the
     current folder, or --path), as `openEMS model.xml` does."""
     import argparse
     ap = argparse.ArgumentParser(prog='gfdtd', description=main.__doc__)
     ap.add_argument('xml')
-    ap.add_argument('--backend', default='auto', help="auto (GPU when CuPy finds one), cupy or numpy")
+    ap.add_argument('--backend', default='auto', help="auto (the GPU when CuPy or Vulkan finds one), gpu, cupy, "
+                    "vulkan, cpu, core or numpy")
     ap.add_argument('--path', default='.', help="folder for the probe files (default: the current folder)")
     ap.add_argument('--numThreads', type=int, default=0, help=argparse.SUPPRESS)
     a, _ = ap.parse_known_args(argv)

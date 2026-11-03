@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gfdtd"
 dynamic = ["version"]
-description = "A 3D FDTD solver in the manner of openEMS, on the GPU (CuPy) or a compiled CPU core; runs openEMS's models"
+description = "A 3D FDTD solver in the manner of openEMS, on the GPU (CuPy or Vulkan) or a compiled CPU core; runs openEMS's models"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "GPL-3.0-or-later"}
@@ -29,6 +29,7 @@ core = ["pybind11>=2.10"]          # python -m gfdtd.core.build: the compiled CP
 gpu-cuda12 = ["cupy-cuda12x>=14"]   # NVIDIA, CUDA 12.x driver
 gpu-cuda13 = ["cupy-cuda13x>=14"]   # NVIDIA, CUDA 13.x driver
 gpu-rocm7 = ["cupy-rocm-7-0>=14"]   # AMD, ROCm 7.0
+gpu-vulkan = ["slangpy>=0.43"]      # any Vulkan GPU (AMD on Windows): the same kernels through Slang (kernels_vk.py)
 test = ["pytest>=7"]
 
 [project.scripts]
@@ -43,6 +44,7 @@ include = ["gfdtd*"]
 
 [tool.setuptools.package-data]
 gfdtd = ["core/*.cpp", "core/*.h", "*.so", "*.pyd"]     # the update code (GPU kernels and CPU core), the built core
+                                                        # (kernels_vk.py reads core/fdtd_core.h too)
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

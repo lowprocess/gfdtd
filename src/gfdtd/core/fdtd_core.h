@@ -1,5 +1,10 @@
 // gfdtd's update maths, one node at a time: shared by the GPU kernels (kernels.py: CUDA / HIP through nvrtc /
-// hiprtc) and the CPU core (gfdtd_core.cpp: g++ or MSVC with OpenMP), so the two run the same arithmetic.
+// hiprtc; kernels_vk.py: Slang to SPIR-V for Vulkan) and the CPU core (gfdtd_core.cpp: g++ or MSVC with OpenMP), so
+// they all run the same arithmetic.
+//
+// Slang (__SLANG__) reads it as it is but for: no `const` on pointers (const is defined away there: Slang's pointers
+// are plain), no C++ templates (GF_TEMPLATE / GF_T: the GPU source fixes the code type as CODE_T), and array
+// arguments as arrays. GF_GPU leaves out the CPU core's row functions.
 //
 // Fields V, I: float32 (3, nx, ny, nz), z fastest. The compressed operator (operator.Compressed): per node a
 // code into tables vv / s / pole of its three E edges ([code * 3 + a]); vi = ke * d_a / (dual_b dual_c) * s and iv = kh * dual_a / (d_b d_c) from the
@@ -9,7 +14,20 @@
 #define GF_DEV inline
 #endif
 
+#ifdef __SLANG__
+#define const
+#ifndef GF_IDX                  // Vulkan: 32-bit indices (the backend keeps 3 nx ny nz below 2^31)
+#define GF_IDX int64_t
+#endif
+typedef GF_IDX idx_t;
+typedef CODE_T C;
+#define GF_TEMPLATE
+#define GF_T(C)
+#else
 typedef long long idx_t;
+#define GF_TEMPLATE template <typename C>
+#define GF_T(C) <C>
+#endif
 
 // a PML term added to a field: the GPU runs all slabs at once and the slabs meet at the corners, so atomically
 #ifndef GF_ADD
@@ -41,7 +59,7 @@ GF_DEV void gf_h_node(int i, int j, int k, idx_t t, const float* V, float* I, co
 }
 
 // one E component: the loop sum c, the coefficients by code, the Debye poles (folded into this update)
-template <typename C>
+GF_TEMPLATE
 GF_DEV void gf_e_comp(int a, idx_t t, float c, float geo, float* V, const C* code, const float* tvv, const float* ts,
                       const int* tpole, const float* tkb, const float* tka, const float* th, int P, const int* slot,
                       float* pol, float dt, idx_t n)
@@ -63,7 +81,7 @@ GF_DEV void gf_e_comp(int a, idx_t t, float c, float geo, float* V, const C* cod
     V[a * n + t] = v;
 }
 
-template <typename C>
+GF_TEMPLATE
 GF_DEV void gf_e_node(int i, int j, int k, idx_t t, float* V, const float* I, const C* code, const float* tvv,
                       const float* ts, const int* tpole, const float* tkb, const float* tka, const float* th, int P,
                       const int* slot, float* pol, const float* G, Dims D, float ke, float dt)
@@ -74,22 +92,22 @@ GF_DEV void gf_e_node(int i, int j, int k, idx_t t, float* V, const float* I, co
     if (i < D.nx - 1) {
         const float c = iz - (j > 0 ? Iz[t - sy] : 0.f) - iy + (k > 0 ? Iy[t - 1] : 0.f);
         const float geo = ke * GF_G(G, D, 0, 0, i) * GF_G(G, D, 3, 1, j) * GF_G(G, D, 3, 2, k);
-        gf_e_comp<C>(0, t, c, geo, V, code, tvv, ts, tpole, tkb, tka, th, P, slot, pol, dt, n);
+        gf_e_comp GF_T(C)(0, t, c, geo, V, code, tvv, ts, tpole, tkb, tka, th, P, slot, pol, dt, n);
     }
     if (j < D.ny - 1) {
         const float c = ix - (k > 0 ? Ix[t - 1] : 0.f) - iz + (i > 0 ? Iz[t - sx] : 0.f);
         const float geo = ke * GF_G(G, D, 0, 1, j) * GF_G(G, D, 3, 2, k) * GF_G(G, D, 3, 0, i);
-        gf_e_comp<C>(1, t, c, geo, V, code, tvv, ts, tpole, tkb, tka, th, P, slot, pol, dt, n);
+        gf_e_comp GF_T(C)(1, t, c, geo, V, code, tvv, ts, tpole, tkb, tka, th, P, slot, pol, dt, n);
     }
     if (k < D.nz - 1) {
         const float c = iy - (i > 0 ? Iy[t - sx] : 0.f) - ix + (j > 0 ? Ix[t - sy] : 0.f);
         const float geo = ke * GF_G(G, D, 0, 2, k) * GF_G(G, D, 3, 0, i) * GF_G(G, D, 3, 1, j);
-        gf_e_comp<C>(2, t, c, geo, V, code, tvv, ts, tpole, tkb, tka, th, P, slot, pol, dt, n);
+        gf_e_comp GF_T(C)(2, t, c, geo, V, code, tvv, ts, tpole, tkb, tka, th, P, slot, pol, dt, n);
     }
 }
 
 // the field energy of one node (both fields, without the dt / 2): V^2 / vi + I^2 / iv
-template <typename C>
+GF_TEMPLATE
 GF_DEV double gf_energy_node(int i, int j, int k, idx_t t, const float* V, const float* I, const C* code,
                              const float* ts, const float* G, Dims D, float ke, float kh)
 {
@@ -98,10 +116,11 @@ GF_DEV double gf_energy_node(int i, int j, int k, idx_t t, const float* V, const
     double e = 0.0;
     for (int a = 0; a < 3; ++a) {
         const int b = (a + 1) % 3, c = (a + 2) % 3;
-        const double vi = (double)ke * GF_G(G, D, 0, a, ii[a]) * GF_G(G, D, 3, b, ii[b]) * GF_G(G, D, 3, c, ii[c]) *
-                          ts[(idx_t)code[t] * 3 + a];
-        const double iv = (double)kh * GF_G(G, D, 2, a, ii[a]) * GF_G(G, D, 1, b, ii[b]) * GF_G(G, D, 1, c, ii[c]);
-        const double v = V[a * n + t], cur = I[a * n + t];
+        const double vi = (double)ke * (double)GF_G(G, D, 0, a, ii[a]) * (double)GF_G(G, D, 3, b, ii[b]) *
+                          (double)GF_G(G, D, 3, c, ii[c]) * (double)ts[(idx_t)code[t] * 3 + a];
+        const double iv = (double)kh * (double)GF_G(G, D, 2, a, ii[a]) * (double)GF_G(G, D, 1, b, ii[b]) *
+                          (double)GF_G(G, D, 1, c, ii[c]);
+        const double v = (double)V[a * n + t], cur = (double)I[a * n + t];
         if (vi > 0) e += v * v / vi;
         if (iv > 0) e += cur * cur / iv;
     }
@@ -114,7 +133,6 @@ GF_DEV double gf_energy_node(int i, int j, int k, idx_t t, const float* V, const
     const idx_t n = (idx_t)D.nx * D.ny * D.nz;                                                          \
     const int L1 = a == 1 ? cnt : D.ny, L2 = a == 2 ? cnt : D.nz;                                       \
     const idx_t sa = a == 0 ? (idx_t)D.ny * D.nz : (a == 1 ? (idx_t)D.nz : (idx_t)1);                   \
-    const int na = a == 0 ? D.nx : (a == 1 ? D.ny : D.nz);                                              \
     const idx_t o1 = (idx_t)((a + 1) % 3) * n, o2 = (idx_t)((a + 2) % 3) * n;                           \
     int k = (int)(e % L2);                                                                              \
     const idx_t r = e / L2;                                                                             \
@@ -123,8 +141,7 @@ GF_DEV double gf_energy_node(int i, int j, int k, idx_t t, const float* V, const
     if (a == 0) i += s0; else if (a == 1) j += s0; else k += s0;                                        \
     const int ia = la + s0;                                                                             \
     const idx_t t = ((idx_t)i * D.ny + j) * D.nz + k;                                                   \
-    const float bb = b[la], cc = c[la];                                                                 \
-    (void)na;
+    const float bb = b[la], cc = c[la];
 
 GF_DEV void gf_pml_e(idx_t e, idx_t m, float* V, const float* I, float* psi, const float* b, const float* c,
                      const float* k1, const float* k2, Dims D, int a, int s0, int cnt)
@@ -144,6 +161,7 @@ GF_DEV void gf_pml_h(idx_t e, idx_t m, const float* V, float* I, float* psi, con
                      const float* k1, const float* k2, Dims D, int a, int s0, int cnt)
 {
     GF_PML_DECODE
+    const int na = a == 0 ? D.nx : (a == 1 ? D.ny : D.nz);
     const float d2 = (ia < na - 1 ? V[o2 + t + sa] : 0.f) - V[o2 + t];
     const float p1 = bb * psi[e] + cc * d2;
     psi[e] = p1;
@@ -154,6 +172,7 @@ GF_DEV void gf_pml_h(idx_t e, idx_t m, const float* V, float* I, float* psi, con
     GF_ADD(&I[o2 + t], -k2[e] * p2);
 }
 
+#ifndef GF_GPU
 // ---- CPU rows: one (i, j) line along z with the boundary tests out of the loops, so that they vectorise --------
 GF_DEV void gf_h_row(int i, int j, const float* V, float* I, const float* G, Dims D, float kh)
 {
@@ -186,7 +205,7 @@ GF_DEV void gf_h_row(int i, int j, const float* V, float* I, const float* G, Dim
 
 // one E component along a row of kn nodes: c = Pp - Pm - Qp + Qm (four rows, the caller's: neighbour rows, a row
 // shifted along z, or zeros), then vv V + vi c vectorised, then the Debye poles of the nodes that have them
-template <typename C>
+GF_TEMPLATE
 GF_DEV void gf_e_row_comp(int a, idx_t t0, int kn, float* Vr, const float* Pp, const float* Pm, const float* Qp,
                           const float* Qm, const float* geo_k, float f, const C* code, const float* tvv,
                           const float* ts, const int* tpole, const float* tkb, const float* tka, const float* th,
@@ -221,7 +240,7 @@ GF_DEV void gf_e_row_comp(int a, idx_t t0, int kn, float* Vr, const float* Pp, c
 }
 
 // the E update of one (i, j) row; scratch: 4 nz floats per thread (zeros, the z-shifted rows, old V)
-template <typename C>
+GF_TEMPLATE
 GF_DEV void gf_e_row(int i, int j, float* V, const float* I, const C* code, const float* tvv, const float* ts,
                      const int* tpole, const float* tkb, const float* tka, const float* th, int P, const int* slot,
                      float* pol, const float* G, Dims D, float ke, float dt, float* scratch, bool poles)
@@ -240,38 +259,41 @@ GF_DEV void gf_e_row(int i, int j, float* V, const float* I, const C* code, cons
     };
     if (i < D.nx - 1) {                              // Vx: c = Iz - Iz[j-1] - Iy + Iy[k-1]
         const float f = ke * GF_G(G, D, 0, 0, i) * GF_G(G, D, 3, 1, j);
-        gf_e_row_comp<C>(0, t0, nz, V + t0, Iz, j > 0 ? Iz - sy : zero, Iy, shifted(Iy), iduz, f, code, tvv, ts,
+        gf_e_row_comp GF_T(C)(0, t0, nz, V + t0, Iz, j > 0 ? Iz - sy : zero, Iy, shifted(Iy), iduz, f, code, tvv, ts,
                          tpole, tkb, tka, th, P, slot, pol, dt, n, old, poles);
     }
     if (j < D.ny - 1) {                              // Vy: c = Ix - Ix[k-1] - Iz + Iz[i-1]
         const float f = ke * GF_G(G, D, 0, 1, j) * GF_G(G, D, 3, 0, i);
-        gf_e_row_comp<C>(1, t0, nz, V + n + t0, Ix, shifted(Ix), Iz, i > 0 ? Iz - sx : zero, iduz, f, code, tvv,
+        gf_e_row_comp GF_T(C)(1, t0, nz, V + n + t0, Ix, shifted(Ix), Iz, i > 0 ? Iz - sx : zero, iduz, f, code, tvv,
                          ts, tpole, tkb, tka, th, P, slot, pol, dt, n, old, poles);
     }
     {                                                // Vz (k < nz - 1): c = Iy - Iy[i-1] - Ix + Ix[j-1]
         const float f = ke * GF_G(G, D, 3, 0, i) * GF_G(G, D, 3, 1, j);
-        gf_e_row_comp<C>(2, t0, nz - 1, V + 2 * n + t0, Iy, i > 0 ? Iy - sx : zero, Ix, j > 0 ? Ix - sy : zero, dz,
+        gf_e_row_comp GF_T(C)(2, t0, nz - 1, V + 2 * n + t0, Iy, i > 0 ? Iy - sx : zero, Ix, j > 0 ? Ix - sy : zero, dz,
                          f, code, tvv, ts, tpole, tkb, tka, th, P, slot, pol, dt, n, old, poles);
     }
 }
 
+#endif  // GF_GPU
+
 // ---- the PML folded into the H / E node updates (GPU): the node's terms of every slab it is in ---------------
 // desc: per slab SLAB values (start of its local index range, m, axis, s0, cnt, offset of b / c); psi: the slabs'
 // psi concatenated (2 m each, from 2 start). The node's own iv / vi from the line arrays (and its code).
-GF_DEV float gf_iv(int a, const int* ii, const float* G, Dims D, float kh)
+GF_DEV float gf_iv(int a, const int ii[3], const float* G, Dims D, float kh)
 {
     const int b = (a + 1) % 3, c = (a + 2) % 3;
     return kh * GF_G(G, D, 2, a, ii[a]) * GF_G(G, D, 1, b, ii[b]) * GF_G(G, D, 1, c, ii[c]);
 }
 
-GF_DEV float gf_vi(int a, const int* ii, const float* G, Dims D, float ke, float s)
+GF_DEV float gf_vi(int a, const int ii[3], const float* G, Dims D, float ke, float s)
 {
     const int b = (a + 1) % 3, c = (a + 2) % 3;
     return ke * GF_G(G, D, 0, a, ii[a]) * GF_G(G, D, 3, b, ii[b]) * GF_G(G, D, 3, c, ii[c]) * s;
 }
 
-template <bool E, typename C>
-GF_DEV void gf_pml_node(int i, int j, int k, idx_t t, float* V, float* I, float* psi, const float* b, const float* c,
+// E: the E field's terms (else H's), a constant at each call: inlined, the other branch drops out
+GF_TEMPLATE
+GF_DEV void gf_pml_node(bool E, int i, int j, int k, idx_t t, float* V, float* I, float* psi, const float* b, const float* c,
                         const idx_t* desc, int ns, const int* box, const C* code, const float* ts, const float* G,
                         Dims D, float kf)
 {

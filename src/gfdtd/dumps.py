@@ -61,17 +61,18 @@ class Region:
     """One dump box's points (cell centres or nodes), with the per-edge scale factors it needs on the backend's
     device. Cell centres: E and J average the four parallel edges of the cell, H its two. Nodes: E and J average
     the two edges along their direction, H the four around the node; edges past the domain don't count. On the GPU
-    (E, H, J) one kernel does it all, and adds the DFT term in the same pass (kernels.py: dump)."""
+    (E, H, J) one kernel does it all, and adds the DFT term in the same pass (kernels.py / kernels_vk.py: dump;
+    backend.dump_kernel)."""
     def __init__(self, d, op, be):
         xp = be.xp
         self.d, self.xp, self.be = d, xp, be
-        self.gpu = getattr(be, 'name', '') == 'cupy' and d['field'] in ('E', 'H', 'J')
+        self.gpu = hasattr(be, 'dump_kernel') and d['field'] in ('E', 'H', 'J')
         self.lo, self.hi, f = d['lo'], d['hi'], d['field']
         self.node = d.get('mode') == 'node'
         self.shape = tuple(h - l + 1 for l, h in zip(self.lo, self.hi))
         if self.gpu:
             self.args = tuple(np.int32(v) for v in ({'E': 0, 'H': 1, 'J': 2}[f], not self.node, *self.lo, *self.shape))
-            self.omega = xp.asarray(2 * np.pi * np.asarray(d['fd'] or [0.0]), np.float32)
+            self.omega = be.up(2 * np.pi * np.asarray(d['fd'] or [0.0]), np.float32)
             return
         self.ext, self.scale, self.count = [], [], []               # per component: edge range, scale, edges averaged
         for a in range(3):
@@ -96,23 +97,20 @@ class Region:
                 self.count.append(np.float32(0.5 ** len(across)))
 
     def _kernel(self, out, nf, t):
-        be = self.be
-        m = int(np.prod(self.shape)) * 3
-        be.k['dump'](((m + be.BLOCK - 1) // be.BLOCK,), (be.BLOCK,), (be.V, be.I, be.G, *be.dims, *self.args,
-                                                                    np.int32(nf), self.omega, np.float32(t), out))
+        self.be.dump_kernel(self, out, nf, t)
 
-    def accumulate(self, acc, t):
+    def accumulate(self, acc, t, V, I):
         """acc (nf, nx, ny, nz, 3) complex += the field x exp(-j w t), on the GPU in one kernel."""
         if self.gpu:
             self._kernel(acc, len(self.d['fd']), t)
         else:
             ph = np.exp(-2j * np.pi * np.asarray(self.d['fd']) * t).astype(np.complex64)
-            acc += self.field(self.be.V, self.be.I)[None] * self.xp.asarray(ph).reshape((-1, 1, 1, 1, 1))
+            acc += self.field(V, I)[None] * self.xp.asarray(ph).reshape((-1, 1, 1, 1, 1))
 
     def field(self, V, I):
         """(nx, ny, nz, 3) float32 on the device."""
         if self.gpu:
-            out = self.xp.empty(self.shape + (3,), np.float32)
+            out = self.be.zeros(self.shape + (3,), np.float32)
             self._kernel(out, 0, 0.0)
             return out
         xp, f = self.xp, self.d['field']
@@ -204,7 +202,11 @@ class Dumps:
                 (notes if notes is not None else []).append("h5py is not installed: frequency-domain dumps skipped")
         for r in self.regions:
             fd = r.d['fd']
-            self.acc.append(self.xp.zeros((len(fd),) + r.shape + (3,), np.complex64) if fd and self.h5 else None)
+            if not (fd and self.h5):
+                self.acc.append(None)
+                continue
+            shape = (len(fd),) + r.shape + (3,)
+            self.acc.append(be.zeros(shape, np.complex64) if r.gpu else self.xp.zeros(shape, np.complex64))
         self.dts = op.sub * op.dt
 
     def __bool__(self):
@@ -217,13 +219,12 @@ class Dumps:
             d = r.d
             if d['fd'] is None:
                 if (step // self.op.sub) % d['sub'] == 0:
-                    F = r.field(be.V, be.I)
-                    F = be.cp.asnumpy(F) if xp is not np else F
+                    F = be.to_host(r.field(*((be.V, be.I) if r.gpu else be.fields())))
                     write_vtr(os.path.join(self.path, f"{d['name']}_{step:010d}.vtr"), d['coords'], F,
                               VTK_NAME[d['field']])
             elif acc is not None:
                 t = (step - (0.5 if d['field'] == 'H' else 0.0)) * self.op.dt
-                r.accumulate(acc, max(t, 0.0))
+                r.accumulate(acc, max(t, 0.0), *((be.V, be.I) if r.gpu else be.fields()))
 
     def close(self):
         """Write the frequency-domain dumps; returns the files written."""
@@ -231,8 +232,7 @@ class Dumps:
         for r, acc in zip(self.regions, self.acc):
             if acc is None:
                 continue
-            data = acc * np.float32(2 * self.dts)
-            data = self.be.cp.asnumpy(data) if self.xp is not np else data
+            data = self.be.to_host(acc) * np.float32(2 * self.dts)
             out.append(os.path.join(self.path, r.d['name'] + '.h5'))
             write_h5(out[-1], r.d, r.d['fd'], data)
         return out

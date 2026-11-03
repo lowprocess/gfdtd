@@ -1,7 +1,7 @@
 # gfdtd
 
-A 3D FDTD solver in the manner of openEMS that runs on a GPU (CuPy: NVIDIA CUDA or AMD ROCm), or on the CPU
-through a compiled core, with numpy as the fallback and the reference. It reads openEMS's models: a script
+A 3D FDTD solver in the manner of openEMS that runs on a GPU (Vulkan through slangpy: any GPU with a Vulkan
+driver, Windows or Linux; or CuPy: NVIDIA CUDA or AMD ROCm), or on the CPU through a compiled core, with numpy as the fallback and the reference. It reads openEMS's models: a script
 written for openEMS's Python interface runs here by swapping two imports, and `gfdtd model.xml` runs an openEMS
 XML file as `openEMS model.xml` does. Neither openEMS nor CSXCAD needs to be installed.
 
@@ -17,16 +17,21 @@ there.
 
 ```bash
 pip install .                       # numpy, scipy, shapely, h5py, emsdev (the GPU probe, CPU threads)
-pip install '.[gpu-rocm7]'          # the GPU: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
+pip install '.[gpu-vulkan]'         # the GPU through Vulkan: slangpy (any GPU)
+pip install '.[gpu-cuda12]'         # optional: the CuPy wheel for your stack (gpu-cuda12, gpu-cuda13, gpu-rocm7)
 pip install '.[core]'               # pybind11, then build the CPU core (g++ with OpenMP; Windows: MSVC or MinGW):
 python -m gfdtd.core.build          # src/gfdtd/_core*.so; GFDTD_ARCH=-march=x86-64-v3 for a portable build
 ```
 
 The CuPy extras conflict: install one. The CUDA wheels need the NVIDIA driver; the ROCm wheel the ROCm 7 runtime
-(Linux only: CuPy has no ROCm wheel for Windows).
+(Linux only: CuPy has no ROCm wheel for Windows). The Vulkan backend needs only the GPU's driver (Vulkan 1.2 with
+buffer device addresses and float32 atomic adds: every desktop GPU of the last several years) and slangpy; it runs
+the same update code as CuPy's, at the same speed on an RX 7800 XT ([Speed](#speed)).
 Without the core the CPU runs on numpy, some 15 times slower. The backend is picked per run (`backend='auto'`:
-the GPU when CuPy finds one, else the core, else numpy); `GFDTD_BACKEND=cupy|core|numpy` overrides it for every
-run.
+a Vulkan GPU, else CuPy's, else the core, else numpy, CuPy first only where it runs on CUDA; `gpu`: the same
+without the CPU);
+`GFDTD_BACKEND=cupy|vulkan|core|numpy` overrides it for every run, `EMSDEV_VULKAN_DEVICE=1` picks the second
+Vulkan GPU.
 
 ## CSXCAD and openEMS compatibility
 
@@ -41,7 +46,7 @@ CSX = ContinuousStructure(); FDTD.SetCSX(CSX)
 ...                                                   # AddMaterial, AddMetal, AddLumpedElement, AddPolygon, ...
 port = FDTD.AddLumpedPort(1, 50, start, stop, 'z', excite=1)
 nf = FDTD.CreateNF2FFBox(frequency=[2.4e9])          # optional: the far field (antennas)
-FDTD.Run(sim_path)                                    # backend='auto' | 'cupy' | 'core' | 'numpy'
+FDTD.Run(sim_path)                                    # backend='auto' | 'gpu' | 'cupy' | 'vulkan' | 'core' | 'numpy'
 port.CalcPort(sim_path, freq)                         # uf_inc, uf_ref, if_tot, ... as openEMS's
 ff = nf.CalcNF2FF(sim_path, [2.4e9], theta, phi)      # ff.Dmax, ff.Prad, ff.E_norm, ... as openEMS's
 ```
@@ -152,8 +157,8 @@ V   = vv * V + vi * (loop sum of I around the dual face)  from C = eps A' / l, G
 - **Time step:** the stability limit of the rectilinear grid (the shortest neighbouring cells around each
   node), times 0.95. That is about 10 % shorter than openEMS's Rennings step.
 
-The engine (`src/gfdtd/engine.py`) is a Python time loop over one backend. The GPU and the CPU core run the same
-update code (`src/gfdtd/core/fdtd_core.h`) on the **compressed operator**:
+The engine (`src/gfdtd/engine.py`) is a Python time loop over one backend. The GPUs (CuPy, Vulkan) and the CPU core
+run the same update code (`src/gfdtd/core/fdtd_core.h`) on the **compressed operator**:
 
 - There are no coefficient arrays. iv is pure geometry, dt dual_a / (mu d_b d_c), from three line arrays. vi is
   that geometry times a per-edge factor s. vv and s come from a table through one code per node, covering its
@@ -164,7 +169,7 @@ update code (`src/gfdtd/core/fdtd_core.h`) on the **compressed operator**:
   only for the nodes that have them, scaled so that their coefficients don't depend on the geometry either.
 - The table is exact to 2^-20 (vv and s are rounded so that equal values match).
 
-The three backends:
+The four backends:
 
 - **CuPy** (`src/gfdtd/kernels.py`): one thread per node, in blocks of 128. The same source compiles for ROCm
   through hiprtc. Fields are float32. A timestep is three launches:
@@ -180,6 +185,15 @@ The three backends:
   that interpolates and adds the DFT term. Probe samples stay on the device. Excitations run in threads, each on
   its own stream, as many at once as fit in the GPU's cache together (`concurrent_runs`: up to 1.2 M cells in
   all; `--jobs` or `GFDTD_CONCURRENT_CELLS` set it).
+- **Vulkan** (`src/gfdtd/kernels_vk.py`, slangpy): the same kernels in Slang, around the same `fdtd_core.h`, which
+  Slang reads as it is (no `const` on its pointers, `GF_TEMPLATE` for the code type: the header's top says
+  what differs). Compiled to SPIR-V when a run starts (cached on disk by slangpy), and run on any Vulkan GPU
+  through Vulkan's buffer device addresses: each kernel reaches the model through one struct of addresses in
+  GPU memory, so a launch sets a pointer and a few values. 32-bit indices, 64 threads a workgroup (1-4 % faster
+  than 128 or 256 on the RX 7800 XT). The same three-launch step, fused or split as CuPy's, the same PML trial,
+  recorded into command buffers of 96 launches that the GPU runs while the host records the next (about 2.5 µs
+  of host time a launch). The energy is summed in double per workgroup on the GPU and the partial sums on the
+  host (RDNA has no float64 atomics in Vulkan). Runs in threads get a Vulkan device each, so they overlap too.
 - **core** (`src/gfdtd/core/gfdtd_core.cpp`, pybind11 and OpenMP): rows along z with the boundary tests outside the
   loops, so that the compiler vectorises them; Mur and PML too. Denormals are flushed to zero while it runs
   (the GPU does this anyway). Before that, the tiny fields ahead of the first wave ran the first few thousand
@@ -261,6 +275,22 @@ What each change gave on the GPU, measured on the benchmark (fused against the s
 | Excitations side by side (threads, a stream each) | 1.2–1.46× in all for 2–4 runs of 0.1–0.6 M cells; rf_diffvia's 2 runs 1.25× |
 | A dump box in one kernel per sample | the far-field box's cost per step from ~38 to ~2 µs (antenna_dipole: 67 µs per step without it) |
 
+**Vulkan against CuPy** on the same card (RX 7800 XT, RADV against ROCm 7; `tools/bench.py`, ms per step, the
+engine's own step):
+
+| Cells | CuPy, PML | Vulkan, PML | CuPy, Mur | Vulkan, Mur |
+|---|---|---|---|---|
+| 0.29 M | 0.065 | 0.066 | 0.043 | 0.049 |
+| 0.97 M | 0.148 | 0.153 | 0.105 | 0.106 |
+| 3.96 M | 0.765 | 0.802 | 0.723 | 0.750 |
+| 15.78 M | 2.768 | 2.735 | 2.840 | 2.869 |
+
+Kernel for kernel Vulkan is as fast or faster; what it loses on small models is the barrier between launches
+(about 7 µs each through slangpy's global barrier, against the launch gaps of a HIP stream). What the Vulkan
+backend's choices gave: one thread per node and 64 a workgroup (a grid of 524 k threads ran 10 % slower), 32-bit
+indices (2-7 %), launching through the compute pass directly (2.5 µs of host time a launch, against 10 µs through
+`ComputeKernel.dispatch`), a short first command buffer after each energy check (8.0 to 7.6 s on the hairpin).
+
 Tried and left out:
 
 - **Marching along x** (a thread per (y, z) column): +12 % at 1 M cells, −16 % at 4–16 M.
@@ -278,10 +308,11 @@ src/gfdtd/
   fdtd.py       openEMS's interface: settings, LumpedPort, the Add...Port methods, Run, the XML; the command line
   ports.py      openEMS's other ports: MSL, stripline, CPW, coaxial, waveguides, curve
   operator.py   the model on the grid: coefficients, lumped elements, excitations, boundaries, probes
-  engine.py     the time loop, the numpy, core and CuPy backends, status lines and probe files
+  engine.py     the time loop, the numpy, core, CuPy and Vulkan backends, status lines and probe files
   dumps.py      the field dumps: cell-centre and node values, .vtr frames, running DFT, HDF5
   nf2ff.py      the far field: openEMS's NF2FF box, CalcNF2FF and its result file
-  kernels.py    the GPU kernels around core/fdtd_core.h
+  kernels.py    the GPU kernels around core/fdtd_core.h (CUDA / HIP)
+  kernels_vk.py the same kernels in Slang, for Vulkan
   core/         fdtd_core.h (the update code, GPU and CPU), gfdtd_core.cpp (the CPU core), build.py
 tests/test_gfdtd.py          compatibility, operator, physics on small models, the far field, GPU and core
                              against numpy

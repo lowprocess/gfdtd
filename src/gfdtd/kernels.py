@@ -156,7 +156,7 @@ extern "C" __global__ void step_h(const float* __restrict__ V, float* __restrict
             GF_IJK
             gf_h_node(i, j, k, t, V, I, G, D, kh);
             if (ns)
-                gf_pml_node<false, CODE_T>(i, j, k, t, (float*)V, I, psi, b, c, desc, ns, box, code, ts, G, D, kh);
+                gf_pml_node<CODE_T>(false, i, j, k, t, (float*)V, I, psi, b, c, desc, ns, box, code, ts, G, D, kh);
         } else {
             const idx_t e = t - n;
             o0[e] = V[m0[e]];
@@ -178,7 +178,7 @@ extern "C" __global__ void step_e(float* __restrict__ V, const float* __restrict
         GF_IJK
         gf_e_node<CODE_T>(i, j, k, t, V, I, code, tvv, ts, tpole, tkb, tka, th, P, slot, pol, G, D, ke, dt);
         if (ns)
-            gf_pml_node<true, CODE_T>(i, j, k, t, V, (float*)I, psi, b, c, desc, ns, box, code, ts, G, D, ke);
+            gf_pml_node<CODE_T>(true, i, j, k, t, V, (float*)I, psi, b, c, desc, ns, box, code, ts, G, D, ke);
     }
 }
 
@@ -313,5 +313,6 @@ extern "C" __global__ void dump(const float* V, const float* I, const float* G, 
 def source(code_t='unsigned short'):
     with open(HEADER, encoding='utf-8') as fh:
         head = fh.read()
-    return (f"#define GF_DEV __device__ inline\n#define GF_ADD(p, v) atomicAdd((p), (v))\n#define CODE_T {code_t}\n" +
+    return (f"#define GF_DEV __device__ inline\n#define GF_GPU 1\n#define GF_ADD(p, v) atomicAdd((p), (v))\n"
+            f"#define CODE_T {code_t}\n" +
             head + KERNELS)
