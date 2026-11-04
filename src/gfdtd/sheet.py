@@ -86,8 +86,41 @@ def z_square(f, sigma, thickness):
     return k / (2 * sigma * np.tanh(k * thickness / 2))
 
 
-def fit_rough(sigma, thickness, f_max, rms):
-    """(G, [(R, tau), ...]) per square of a rough sheet: its resistance z_square.real x hammerstad, fitted from
+def load_finish(z, f, finish):
+    """A face's impedance z (per square, at f) under finish layers [(sigma, t m), ...] (outermost first): each a
+    line section of Z_i = k_i / sigma_i loading the one beneath."""
+    import numpy as np
+    from .constants import MU0
+    w = 2 * np.pi * np.asarray(f, float)
+    for s, t in reversed(list(finish)):
+        k = (1 + 1j) * np.sqrt(w * MU0 * s / 2)
+        zc, th = k / s, np.tanh(k * t)
+        z = zc * (z + zc * th) / (zc + z * th)
+    return z
+
+
+def target(f, sigma, thickness, rms=0.0, finish=(), share=1.0, face=False):
+    """A sheet's impedance per square at f: openEMS's (z_square), its resistance times Hammerstad's factor for rms
+    (m RMS), and a surface finish on `share` of its loss: z (1 + share (F - 1)), F the finished face over the bare
+    one. face: the sheet is one face of copper of conductivity 4 sigma (gfdtd's thick copper: sigma / 4 and twice
+    the thickness give one face's impedance), whose skin depth Hammerstad's factor takes; otherwise both faces in
+    parallel (a face is twice the sheet)."""
+    z0 = z_square(f, sigma, thickness)
+    s_cu = 4 * sigma if face else sigma
+    z = z0.real * hammerstad(f, rms, s_cu) + 1j * z0.imag if rms else z0
+    if finish:
+        zf = z0 if face else 2 * z0
+        z = z * (1 + share * (load_finish(zf, f, finish) / zf - 1))
+    return z
+
+
+def fit_rough(sigma, thickness, f_max, rms, finish=(), share=1.0, face=False):
+    """fit_target of a rough (and finished) sheet: fit_target(target(...)); kept for its callers."""
+    return fit_target(lambda f: target(f, sigma, thickness, rms, finish, share, face), sigma, thickness, f_max)
+
+
+def fit_target(zfun, sigma, thickness, f_max):
+    """(G, [(R, tau), ...]) per square of a sheet of impedance zfun(f) (rough: target()), fitted from
     f_max / 10^FIT_DECADES to 2 f_max as a passive R-L impedance R0 + sum R_k s tau_k / (1 + s tau_k) on fixed tau_k
     (non-negative least squares, relative, the reactance weighted FIT_IM_WEIGHT: Hammerstad's factor scales the
     loss only, and the fit gives it the reactance a causal surface has), then turned into admittance branches,
@@ -97,8 +130,7 @@ def fit_rough(sigma, thickness, f_max, rms):
     from scipy.optimize import nnls
     f = np.logspace(np.log10(f_max) - FIT_DECADES, np.log10(2 * f_max), 300)
     w = 2 * np.pi * f
-    z0 = z_square(f, sigma, thickness)
-    zt = z0.real * hammerstad(f, rms, sigma) + 1j * z0.imag
+    zt = zfun(f)
     tau = 1 / (2 * np.pi * np.logspace(np.log10(f_max) - FIT_DECADES, np.log10(4 * f_max), FIT_BRANCHES))
     st = 1j * w[:, None] * tau[None, :]
     A = np.concatenate([np.ones((len(f), 1)), st / (1 + st)], 1)
@@ -115,6 +147,6 @@ def fit_rough(sigma, thickness, f_max, rms):
     res = ((-(Cm / zinf) @ V)[0] * (np.linalg.inv(V) @ Bm)[:, 0] / zinf).real
     lam = lam.real
     if np.any(lam >= 0) or np.any(res <= 0):
-        raise ValueError("gfdtd: the rough sheet's fit is not passive")
+        raise ValueError("gfdtd: the sheet's wideband fit (rough or finished) is not passive")
     # Y = 1 / zinf + sum res / (s - lam) = G + sum 1 / (R + s L): L = 1 / res, R = -lam L
     return 1 / zinf, [(-l / r, -1 / l) for l, r in zip(lam, res)]

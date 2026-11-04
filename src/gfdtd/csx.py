@@ -319,10 +319,15 @@ class Metal(Property):
 class ConductingSheet(Property):
     kind = 'ConductingSheet'
 
-    def __init__(self, name, conductivity=0.0, thickness=0.0, roughness=0.0, **kw):
+    def __init__(self, name, conductivity=0.0, thickness=0.0, roughness=0.0, finish=(), finish_share=1.0, face=False,
+                 **kw):
         super().__init__(name)
         self.conductivity, self.thickness = _num(conductivity), _num(thickness)
         self.roughness = _num(roughness)        # m RMS (gfdtd's: Hammerstad's loss factor; openEMS ignores it)
+        # gfdtd's, beyond openEMS: a surface finish [(sigma, t m), ...] outermost first, on finish_share of the
+        # sheet's loss; face: the sheet is one face of copper (sigma / 4 and twice the thickness of the copper's)
+        self.finish = [(_num(s), _num(t)) for s, t in finish]
+        self.finish_share, self.face = _num(finish_share), bool(face)
 
 
 class LumpedElement(Property):
@@ -520,8 +525,9 @@ class ContinuousStructure:
     def AddMetal(self, name):
         return self.AddProperty(Metal(name))
 
-    def AddConductingSheet(self, name, conductivity=0.0, thickness=0.0, roughness=0.0, **kw):
-        return self.AddProperty(ConductingSheet(name, conductivity, thickness, roughness))
+    def AddConductingSheet(self, name, conductivity=0.0, thickness=0.0, roughness=0.0, finish=(), finish_share=1.0,
+                           face=False, **kw):
+        return self.AddProperty(ConductingSheet(name, conductivity, thickness, roughness, finish, finish_share, face))
 
     def AddLumpedElement(self, name, ny, caps=True, **kw):
         return self.AddProperty(LumpedElement(name, ny, caps, **kw))
@@ -623,6 +629,11 @@ def _write_property(parent, p, pid):
         a.update(Conductivity=_fmt(p.conductivity), Thickness=_fmt(p.thickness))
         if p.roughness:
             a['Roughness'] = _fmt(p.roughness)                     # gfdtd's; openEMS reads past it
+        if p.finish:                                               # gfdtd's too
+            a['Finish'] = ','.join(f"{_fmt(s)}:{_fmt(t)}" for s, t in p.finish)
+            a['FinishShare'] = _fmt(p.finish_share)
+        if p.face:
+            a['Face'] = '1'
     elif isinstance(p, LumpedElement):
         a.update(Direction=str(p.ny), Caps='1' if p.caps else '0')
         for k in ('R', 'C', 'L'):
@@ -724,8 +735,10 @@ def _read_property(pe, skipped):
     elif tag == 'Metal':
         p = Metal(name)
     elif tag == 'ConductingSheet':
+        fin = [tuple(float(v) for v in x.split(':')) for x in pe.get('Finish', '').split(',') if x]
         p = ConductingSheet(name, float(pe.get('Conductivity', 0)), float(pe.get('Thickness', 0)),
-                            float(pe.get('Roughness', 0)))
+                            float(pe.get('Roughness', 0)), fin, float(pe.get('FinishShare', 1)),
+                            pe.get('Face', '0') == '1')
     elif tag == 'LumpedElement':
         val = lambda k: float(pe.get(k)) if pe.get(k) not in (None, 'nan') else None
         p = LumpedElement(name, int(pe.get('Direction', 0)), pe.get('Caps', '1') == '1', R=val('R'), C=val('C'),

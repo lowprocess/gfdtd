@@ -785,8 +785,43 @@ def test_api_version_and_its_names():
     import inspect
     import gfdtd
     from gfdtd import engine
-    assert gfdtd.API_VERSION == (1, 2)
+    assert gfdtd.API_VERSION == (1, 3)
+    sheet = inspect.signature(gfdtd.ContinuousStructure.AddConductingSheet).parameters
+    assert {'roughness', 'finish', 'finish_share', 'face'} <= set(sheet)      # 1.2, 1.3
     assert 'backend' in inspect.signature(gfdtd.openEMS).parameters and gfdtd.ContinuousStructure
     for name, args in (('gpu_info', []), ('core_info', []), ('resolve_backend', ['name']),
                        ('concurrent_runs', ['cells', 'runs'])):
         assert list(inspect.signature(getattr(engine, name)).parameters) == args, name
+
+
+def test_finished_sheet_fit_and_xml(tmp_path):
+    """A finished sheet (gfdtd 1.3): the wideband fit follows the target (ENIG on all of one face: its resistance
+    2-5x the bare face's from 1 to 10 GHz), the share scales it, and finish / share / face survive the XML."""
+    import numpy as np
+    from gfdtd import sheet as S
+    from gfdtd.csx import ContinuousStructure
+    enig = [(4.1e7, 0.08e-6), (1.45e6, 5e-6)]
+    sigma, t = 5.8e7 / 4, 2 * 17.5e-6                               # one face of 35 um copper (thick model)
+    f = np.array([1e9, 3e9, 10e9])
+    bare = S.target(f, sigma, t, face=True).real
+    full = S.target(f, sigma, t, finish=enig, share=1.0, face=True).real
+    half = S.target(f, sigma, t, finish=enig, share=0.5, face=True).real
+    assert np.all(full / bare > 2.0) and np.all(full / bare < 6.0)
+    assert np.allclose(half / bare, 1 + 0.5 * (full / bare - 1), rtol=1e-6)
+    g, br = S.fit_rough(sigma, t, 10e9, 0.0, enig, 1.0, True)
+    y = g + sum(1 / (r + 2j * np.pi * f * r * tau) for r, tau in br)
+    assert np.allclose((1 / y).real, full, rtol=0.05)               # the fit within 5 % in resistance
+    # rough faces: Hammerstad on the copper's skin depth (4 sigma), not the sheet's sigma / 4 one's
+    k_face = S.target(3e9, sigma, t, rms=1e-6, face=True).real / S.target(3e9, sigma, t, face=True).real
+    k_cu = float(S.hammerstad(3e9, 1e-6, 4 * sigma))
+    assert abs(k_face - k_cu) < 1e-9
+    CSX = ContinuousStructure()
+    CSX.GetGrid().SetDeltaUnit(1e-3)
+    CSX.GetGrid().SetLines('x', [0, 1]); CSX.GetGrid().SetLines('y', [0, 1]); CSX.GetGrid().SetLines('z', [0, 1])
+    cu = CSX.AddConductingSheet('cu', conductivity=sigma, thickness=t, finish=enig, finish_share=0.4, face=True)
+    cu.AddBox([0, 0, 0], [1, 1, 0], priority=10)
+    CSX.Write2XML(str(tmp_path / 'm.xml'))
+    back = ContinuousStructure()
+    back.ReadFromXML(str(tmp_path / 'm.xml'))
+    p = next(q for q in back.GetAllProperties() if q.name == 'cu')
+    assert np.allclose(p.finish, enig) and p.finish_share == 0.4 and p.face

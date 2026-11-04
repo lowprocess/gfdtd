@@ -29,9 +29,11 @@ kicad2ems's models here): a minor release adds to it, a major one removes or cha
     __version__
     1.1: conducting sheets are lossy (openEMS's model), no longer PEC
     1.2: ConductingSheet(roughness=): rough copper (m RMS, Hammerstad's loss factor, a wideband fit)
+    1.3: ConductingSheet(finish=, finish_share=, face=): a surface finish (metal layers on the copper, on a share of
+         the sheet's loss), and a sheet that is one face of thick copper (its roughness on that copper's skin depth)
 """
-__version__ = '261104-r1'
-API_VERSION = (1, 2)
+__version__ = '261104-r2'
+API_VERSION = (1, 3)
 
 from .csx import ContinuousStructure                                # noqa: E402,F401
 from .fdtd import openEMS, LumpedPort                               # noqa: E402,F401

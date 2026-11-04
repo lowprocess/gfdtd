@@ -324,8 +324,9 @@ def _sheet_edges(sheets, sheet_of, sheet_m, grid, lE, dt, f_max, notes):
     par = []                                                        # per sheet: (G_sq, [(R_sq, tau), ...])
     for p, _ in sheets:
         rms = getattr(p, 'roughness', 0.0) or 0.0
-        if rms > 0:
-            par.append(S.fit_rough(p.conductivity, p.thickness, f_max, rms))
+        fin, share, face = getattr(p, 'finish', ()), getattr(p, 'finish_share', 1.0), getattr(p, 'face', False)
+        if rms > 0 or (fin and share > 0):
+            par.append(S.fit_rough(p.conductivity, p.thickness, f_max, rms, fin if share > 0 else (), share, face))
             continue
         g, r1, l1, r2, l2, ok = S.per_square(p.conductivity, p.thickness, f_max)
         par.append((g, [(r1, l1 / r1), (r2, l2 / r2)]))
@@ -369,8 +370,12 @@ def _sheet_edges(sheets, sheet_of, sheet_m, grid, lE, dt, f_max, notes):
     cat = lambda v: np.concatenate(v)
     for p in {id(p): p for p, _ in sheets}.values():
         rms = getattr(p, 'roughness', 0.0) or 0.0
+        fin, share = getattr(p, 'finish', ()), getattr(p, 'finish_share', 1.0)
+        extra = ([f"{rms * 1e6:g} um RMS rough (Hammerstad)"] if rms else []) + \
+                ([f"finished ({' / '.join(f'{t * 1e6:g} um at {s:g} S/m' for s, t in fin)}) on {share:.0%} of its loss"]
+                 if fin and share > 0 else [])
         notes.append(f"conducting sheet {p.name}: {p.conductivity:g} S/m, {p.thickness * 1e6:g} um" +
-                     (f", {rms * 1e6:g} um RMS rough (Hammerstad, a wideband fit to {2 * f_max / 1e9:g} GHz)" if rms else
+                     (f", {', '.join(extra)} (a wideband fit to {2 * f_max / 1e9:g} GHz)" if extra else
                       f" (openEMS's model, fitted to {f_max / 1e9:g} GHz)"))
     return cat(idx).astype(np.int64), cat(cap), cat(cond), branches
 
