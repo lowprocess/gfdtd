@@ -28,9 +28,10 @@ kicad2ems's models here): a minor release adds to it, a major one removes or cha
     engine.concurrent_runs(cells, runs)          how many runs to have on the GPU at once
     __version__
     1.1: conducting sheets are lossy (openEMS's model), no longer PEC
+    1.2: ConductingSheet(roughness=): rough copper (m RMS, Hammerstad's loss factor, a wideband fit)
 """
 __version__ = '261104-r1'
-API_VERSION = (1, 1)
+API_VERSION = (1, 2)
 
 from .csx import ContinuousStructure                                # noqa: E402,F401
 from .fdtd import openEMS, LumpedPort                               # noqa: E402,F401

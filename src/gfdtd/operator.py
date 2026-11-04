@@ -16,7 +16,8 @@ Materials are sampled at cell centres (highest priority wins) and averaged over 
 each edge. Metals take the edges whose midpoint is in a primitive; flat primitives snap to the nearest mesh line.
 Metal is PEC; a ConductingSheet on a flat primitive is openEMS's conducting-sheet model (gfdtd.sheet: a
 conductance and two R-L branches per edge, fitted to the sheet's skin-effect impedance up to f0 + fc), PEC on
-other primitives and next to the boundaries, as openEMS's. Lumped elements spread their R / L / C over the edges in their box
+other primitives and next to the boundaries, as openEMS's. A rough sheet (roughness > 0, gfdtd's) takes a
+wideband fit of its rough impedance instead: more R-L branches. Lumped elements spread their R / L / C over the edges in their box
 (parallel, or series RLC on each edge), with metal caps; soft E excitations add exc_val x signal to their edges.
 
 Debye materials: each pole is a polarisation current i on the edges, tau di/dt + i = C_p dV/dt (C_p = eps0
@@ -310,24 +311,29 @@ def _bc_size(b):
 
 
 def _sheet_edges(sheets, sheet_of, sheet_m, grid, lE, dt, f_max, notes):
-    """openEMS's conducting-sheet model (gfdtd.sheet) on the edges in sheet_m: (flat edge indices, C, G,
-    [(R1, L1), (R2, L2)]), each per edge, or None. A sheet of conductivity sigma and thickness t gives the edge
-    the conductance G = G_sq / f / w and two series R-L branches R_k = R_k,sq f w, L_k = L_k,sq f w in parallel,
-    w = (edge length) / (node width across it), f = 2 on the sheet's border (half the width covered). Its C is
-    openEMS's, dt^2 / 4 (16 / min(L) + 1 / L1 + 1 / L2), in place of the dielectric's. The branches come back
-    as (R, tau = L / R): tau is the sheet's, so that one sheet's poles share their two relaxations exactly."""
+    """The conducting-sheet model (gfdtd.sheet) on the edges in sheet_m: (flat edge indices, C, G per edge,
+    [(edges, R, tau), ...] one per R-L branch), or None. A sheet's square has a conductance G_sq and R-L branches
+    (R_sq, tau): openEMS's two (per_square), or a rough sheet's wideband fit (fit_rough). An edge takes
+    G = G_sq / f / w and R = R_sq f w, L = tau R, w = (edge length) / (node width across it), f = 2 on the sheet's
+    border (half the width covered). Its C is openEMS's, dt^2 / 4 (16 / min(L) + sum 1 / L), in place of the
+    dielectric's. tau is the sheet's, so that one sheet's poles share their relaxations exactly."""
     from . import sheet as S
     if not sheet_m.any():
         return None
     sh = sheet_m.shape[1:]
-    par = np.array([S.per_square(p.conductivity, p.thickness, f_max)[:5] for p, _ in sheets])   # (nsheet, 5)
-    nrm = np.array([n for _, n in sheets])
-    tau = np.stack([par[:, 2] / par[:, 1], par[:, 4] / par[:, 3]], 1)
-    for (p, _), ok in zip(sheets, [S.per_square(p.conductivity, p.thickness, f_max)[5] for p, _ in sheets]):
+    par = []                                                        # per sheet: (G_sq, [(R_sq, tau), ...])
+    for p, _ in sheets:
+        rms = getattr(p, 'roughness', 0.0) or 0.0
+        if rms > 0:
+            par.append(S.fit_rough(p.conductivity, p.thickness, f_max, rms))
+            continue
+        g, r1, l1, r2, l2, ok = S.per_square(p.conductivity, p.thickness, f_max)
+        par.append((g, [(r1, l1 / r1), (r2, l2 / r2)]))
         if not ok:
             notes.append(f"conducting sheet {p.name}: {p.thickness * 1e6:g} um at {p.conductivity:g} S/m is past the "
                          f"model's fit at {f_max / 1e9:g} GHz (openEMS's last row used, as openEMS does)")
-    idx, cap, cond, R1, L1, R2, L2 = ([] for _ in range(7))
+    nrm = np.array([n for _, n in sheets])
+    idx, cap, cond, branches = [], [], [], []
     for a in range(3):
         ijk = np.nonzero(sheet_m[a])
         if not len(ijk[0]):
@@ -350,18 +356,23 @@ def _sheet_edges(sheets, sheet_of, sheet_m, grid, lE, dt, f_max, notes):
             prev[b] = np.maximum(prev[b], 0)
             border = ~sheet_m[b][here] | ~(sheet_m[b][tuple(prev)] & has_prev)
             f[np.nonzero(sel)[0][border]] = 2.0
-        g, r1, l1, r2, l2 = (par[sid, n] for n in range(5))
-        l1e, l2e = l1 * f * w, l2 * f * w
-        idx.append(np.ravel_multi_index((np.full(len(sid), a),) + ijk, (3,) + sh))
-        cond.append(g / f / w)
-        cap.append(dt * dt / 4 * (16 / np.minimum(l1e, l2e) + 1 / l1e + 1 / l2e))
-        R1.append(r1 * f * w), R2.append(r2 * f * w)
-        L1.append(tau[sid, 0]), L2.append(tau[sid, 1])                 # tau = L / R: the same for every edge
+        flat = np.ravel_multi_index((np.full(len(sid), a),) + ijk, (3,) + sh)
+        for n in np.unique(sid):                                    # sheet by sheet: its own branches
+            mine = sid == n
+            g, br = par[n]
+            fw = (f * w)[mine]
+            L = [r * tau * fw for r, tau in br]
+            idx.append(flat[mine])
+            cond.append(g / fw)
+            cap.append(dt * dt / 4 * (16 / np.min(L, axis=0) + sum(1 / x for x in L)))
+            branches += [(flat[mine], r * fw, tau) for r, tau in br]
     cat = lambda v: np.concatenate(v)
     for p in {id(p): p for p, _ in sheets}.values():
-        notes.append(f"conducting sheet {p.name}: {p.conductivity:g} S/m, {p.thickness * 1e6:g} um (openEMS's model, "
-                     f"fitted to {f_max / 1e9:g} GHz)")
-    return (cat(idx).astype(np.int64), cat(cap), cat(cond), [(cat(R1), cat(L1)), (cat(R2), cat(L2))])  # (R, tau)
+        rms = getattr(p, 'roughness', 0.0) or 0.0
+        notes.append(f"conducting sheet {p.name}: {p.conductivity:g} S/m, {p.thickness * 1e6:g} um" +
+                     (f", {rms * 1e6:g} um RMS rough (Hammerstad, fitted from DC to {2 * f_max / 1e9:g} GHz)" if rms else
+                      f" (openEMS's model, fitted to {f_max / 1e9:g} GHz)"))
+    return cat(idx).astype(np.int64), cat(cap), cat(cond), branches
 
 
 def build(csx, fdtd, log=None):
@@ -521,11 +532,11 @@ def build(csx, fdtd, log=None):
                 op.debye.append((_flat(sh, a, *nz), np.full(len(kb), (2 * tau - dt) / (2 * tau + dt)), kb,
                                  np.ones(len(kb))))
     if rl is not None:
-        for R, tau in rl[3]:                                        # L di/dt + R i = V: tau = L / R
+        for e, R, tau in rl[3]:                                     # L di/dt + R i = V: tau = L / R
             kb = dt / (R * (2 * tau + dt))
-            kb_sum.reshape(-1)[sidx] += kb
-            kbs_sum.reshape(-1)[sidx] -= kb
-            op.debye.append((sidx, (2 * tau - dt) / (2 * tau + dt), kb, -np.ones(len(kb))))
+            kb_sum.reshape(-1)[e] += kb
+            kbs_sum.reshape(-1)[e] -= kb
+            op.debye.append((e, np.full(len(e), (2 * tau - dt) / (2 * tau + dt)), kb, -np.ones(len(kb))))
     if op.debye:
         idx, ka, kb, sg = (np.concatenate(v) for v in zip(*op.debye))
         op.debye = (idx.astype(np.int64), ka, kb, sg)

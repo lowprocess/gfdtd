@@ -319,9 +319,10 @@ class Metal(Property):
 class ConductingSheet(Property):
     kind = 'ConductingSheet'
 
-    def __init__(self, name, conductivity=0.0, thickness=0.0, **kw):
+    def __init__(self, name, conductivity=0.0, thickness=0.0, roughness=0.0, **kw):
         super().__init__(name)
         self.conductivity, self.thickness = _num(conductivity), _num(thickness)
+        self.roughness = _num(roughness)        # m RMS (gfdtd's: Hammerstad's loss factor; openEMS ignores it)
 
 
 class LumpedElement(Property):
@@ -519,8 +520,8 @@ class ContinuousStructure:
     def AddMetal(self, name):
         return self.AddProperty(Metal(name))
 
-    def AddConductingSheet(self, name, conductivity=0.0, thickness=0.0, **kw):
-        return self.AddProperty(ConductingSheet(name, conductivity, thickness))
+    def AddConductingSheet(self, name, conductivity=0.0, thickness=0.0, roughness=0.0, **kw):
+        return self.AddProperty(ConductingSheet(name, conductivity, thickness, roughness))
 
     def AddLumpedElement(self, name, ny, caps=True, **kw):
         return self.AddProperty(LumpedElement(name, ny, caps, **kw))
@@ -620,6 +621,8 @@ def _write_property(parent, p, pid):
         a['Isotropy'] = '1'
     elif isinstance(p, ConductingSheet):
         a.update(Conductivity=_fmt(p.conductivity), Thickness=_fmt(p.thickness))
+        if p.roughness:
+            a['Roughness'] = _fmt(p.roughness)                     # gfdtd's; openEMS reads past it
     elif isinstance(p, LumpedElement):
         a.update(Direction=str(p.ny), Caps='1' if p.caps else '0')
         for k in ('R', 'C', 'L'):
@@ -721,7 +724,8 @@ def _read_property(pe, skipped):
     elif tag == 'Metal':
         p = Metal(name)
     elif tag == 'ConductingSheet':
-        p = ConductingSheet(name, float(pe.get('Conductivity', 0)), float(pe.get('Thickness', 0)))
+        p = ConductingSheet(name, float(pe.get('Conductivity', 0)), float(pe.get('Thickness', 0)),
+                            float(pe.get('Roughness', 0)))
     elif tag == 'LumpedElement':
         val = lambda k: float(pe.get(k)) if pe.get(k) not in (None, 'nan') else None
         p = LumpedElement(name, int(pe.get('Direction', 0)), pe.get('Caps', '1') == '1', R=val('R'), C=val('C'),

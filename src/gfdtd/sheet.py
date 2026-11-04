@@ -61,3 +61,60 @@ def per_square(sigma, thickness, f_max):
     ok = row is not None
     row = len(OMEGA_STOP) - 1 if row is None else row
     return (g0 * G[row], R1[row] / g0, L1[row] / (g0 * w0), R2[row] / g0, L2[row] / (g0 * w0), ok)
+
+
+# ---- surface roughness: a wideband fit of the rough sheet (gfdtd's, beyond openEMS) ------------------------------
+FIT_BRANCHES = 10       # time constants of the impedance fit (7-9 admittance poles come out of it)
+FIT_DECADES = 4         # the fit from f_max / 10^FIT_DECADES to 2 f_max
+FIT_IM_WEIGHT = 0.05    # the reactance's weight in the fit against the resistance's 1
+
+
+def hammerstad(f, rms, sigma):
+    """Hammerstad and Jensen's roughness factor 1 + 2 / pi atan(1.4 (rms / delta)^2) of the conductor loss."""
+    import numpy as np
+    from .constants import MU0
+    delta = 1 / np.sqrt(np.pi * np.asarray(f, float) * MU0 * sigma)
+    return 1 + 2 / np.pi * np.arctan(1.4 * (rms / delta) ** 2)
+
+
+def z_square(f, sigma, thickness):
+    """The sheet's impedance per square in openEMS's model: a conductor of that thickness with current on both
+    faces, k / (2 sigma tanh(k t / 2)), k = (1 + j) / delta."""
+    import numpy as np
+    from .constants import MU0
+    k = (1 + 1j) * np.sqrt(np.pi * np.asarray(f, float) * MU0 * sigma)
+    return k / (2 * sigma * np.tanh(k * thickness / 2))
+
+
+def fit_rough(sigma, thickness, f_max, rms):
+    """(G, [(R, tau), ...]) per square of a rough sheet: its resistance z_square.real x hammerstad, fitted from
+    f_max / 10^FIT_DECADES to 2 f_max as a passive R-L impedance R0 + sum R_k s tau_k / (1 + s tau_k) on fixed tau_k
+    (non-negative least squares, relative, the reactance weighted FIT_IM_WEIGHT: Hammerstad's factor scales the
+    loss only, and the fit gives it the reactance a causal surface has), then turned into admittance branches,
+    G + sum 1 / (R + s L), tau = L / R, as the sheet's edges take them (the inverse of its state space: R-L
+    networks have both forms). DC is the sheet's sigma t."""
+    import numpy as np
+    from scipy.optimize import nnls
+    f = np.logspace(np.log10(f_max) - FIT_DECADES, np.log10(2 * f_max), 300)
+    w = 2 * np.pi * f
+    z0 = z_square(f, sigma, thickness)
+    zt = z0.real * hammerstad(f, rms, sigma) + 1j * z0.imag
+    tau = 1 / (2 * np.pi * np.logspace(np.log10(f_max) - FIT_DECADES, np.log10(4 * f_max), FIT_BRANCHES))
+    st = 1j * w[:, None] * tau[None, :]
+    A = np.concatenate([np.ones((len(f), 1)), st / (1 + st)], 1)
+    W = (1 / np.abs(zt))[:, None]
+    x, _ = nnls(np.concatenate([(A * W).real, FIT_IM_WEIGHT * (A * W).imag]),
+                np.concatenate([(zt * W[:, 0]).real, FIT_IM_WEIGHT * (zt * W[:, 0]).imag]))
+    R0, Rk = x[0], x[1:]
+    keep = Rk > 0
+    Rk, tk = Rk[keep], tau[keep]
+    # Z = Zinf - sum (R_k / tau_k) / (s + 1 / tau_k), Zinf = R0 + sum R_k: Y = 1 / Z by the inverse state space
+    zinf = R0 + Rk.sum()
+    Am, Bm, Cm = np.diag(-1 / tk), np.ones((len(tk), 1)), -(Rk / tk)[None, :]
+    lam, V = np.linalg.eig(Am - Bm @ Cm / zinf)
+    res = ((-(Cm / zinf) @ V)[0] * (np.linalg.inv(V) @ Bm)[:, 0] / zinf).real
+    lam = lam.real
+    if np.any(lam >= 0) or np.any(res <= 0):
+        raise ValueError("gfdtd: the rough sheet's fit is not passive")
+    # Y = 1 / zinf + sum res / (s - lam) = G + sum 1 / (R + s L): L = 1 / res, R = -lam L
+    return 1 / zinf, [(-l / r, -1 / l) for l, r in zip(lam, res)]

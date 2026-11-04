@@ -515,6 +515,51 @@ def test_conducting_sheet_edges_are_openems_model(prim):
         np.testing.assert_allclose(op.vv.reshape(-1)[e], (cap - G / f / w * dt / 2 - kbs * dt / 2) / den, rtol=1e-9)
 
 
+def test_rough_sheet_fit_is_passive_and_follows_hammerstad():
+    """fit_rough: R-L branches (passive) whose resistance is Hammerstad's factor x the smooth sheet's within 2 %
+    from f_max / 100 to f_max, and the sheet's sigma t at DC."""
+    from gfdtd import sheet
+    f = np.logspace(np.log10(20e9) - 2, np.log10(20e9), 60)
+    for t, rms in ((18e-6, 0.5e-6), (35e-6, 1e-6), (70e-6, 3e-6)):
+        G, br = sheet.fit_rough(5.8e7, t, 20e9, rms)
+        assert G >= 0 and br and all(R > 0 and tau > 0 for R, tau in br)
+        Y = G + sum(1 / (R + 2j * np.pi * f * R * tau) for R, tau in br)
+        want = sheet.z_square(f, 5.8e7, t).real * sheet.hammerstad(f, rms, 5.8e7)
+        np.testing.assert_allclose((1 / Y).real, want, rtol=0.02)
+        assert G + sum(1 / R for R, _ in br) == pytest.approx(5.8e7 * t, rel=0.01)
+
+
+def test_rough_sheet_in_the_operator_and_xml(tmp_path):
+    """roughness: more R-L poles on the sheet's edges, kept through openEMS's XML (an attribute openEMS reads past),
+    and the core runs it as numpy does."""
+    from gfdtd.operator import build
+    F, csx = _sheet_model()
+    csx.GetAllProperties()[0].roughness = 1e-6
+    op = build(csx, F.settings())
+    idx, ka, kb, sg = op.debye
+    assert set(sg) == {-1.0} and len(np.unique(ka)) > 2 and any('RMS rough' in n for n in op.notes)
+    F.Write2XML(str(tmp_path / 'm.xml'))
+    G = openEMS()
+    G.ReadFromXML(str(tmp_path / 'm.xml'))
+    assert G.csx.GetAllProperties()[0].roughness == pytest.approx(1e-6)
+    if core_info()[0]:
+        _, a, _, Fa = _plate_wave(tmp_path / 'n', 30, 'MUR', 'numpy', sheet=True)
+        for p in Fa.csx.GetAllProperties():
+            if type(p).__name__ == 'ConductingSheet':
+                p.roughness = 0.5e-6
+        _, a, _, _ = _plate_wave_with(tmp_path / 'n2', Fa, 'numpy')
+        _, b, _, _ = _plate_wave_with(tmp_path / 'c2', Fa, 'core')
+        np.testing.assert_allclose(a, b, atol=1e-5 * np.abs(a).max())
+
+
+def _plate_wave_with(path, F, backend):
+    """Run openEMS object F (a _plate_wave model) again in `path` on `backend`."""
+    from gfdtd.fdtd import read_probe
+    F.Run(str(path), cleanup=True, verbose=0, backend=backend)
+    t, u = read_probe(os.path.join(str(path), 'ut'))
+    return t, u, str(path), F
+
+
 def test_conducting_sheet_falls_back_to_pec():
     """openEMS's rules: a sheet on a 3D primitive, or with no thickness, is PEC; so are sheet edges next to a
     Mur boundary (its two outer lines)."""
@@ -740,7 +785,7 @@ def test_api_version_and_its_names():
     import inspect
     import gfdtd
     from gfdtd import engine
-    assert gfdtd.API_VERSION == (1, 1)
+    assert gfdtd.API_VERSION == (1, 2)
     assert 'backend' in inspect.signature(gfdtd.openEMS).parameters and gfdtd.ContinuousStructure
     for name, args in (('gpu_info', []), ('core_info', []), ('resolve_backend', ['name']),
                        ('concurrent_runs', ['cells', 'runs'])):

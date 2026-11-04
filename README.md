@@ -68,7 +68,7 @@ Stop and S-parameter code among them) work on gfdtd unchanged.
 | Grid | rectilinear, Cartesian |
 | Materials | isotropic epsilon and conductivity (kappa), averaged over the four cells around each edge |
 | Dispersion | Debye materials (`DebyeMaterial`, any number of poles): `--diel wideband` |
-| Metal | `Metal` as PEC; `ConductingSheet` (conductivity, thickness: kicad2ems's `--sigma`) with openEMS's conductor-loss model on flat primitives, PEC on others and next to the boundaries, as openEMS's |
+| Metal | `Metal` as PEC; `ConductingSheet` (conductivity, thickness: kicad2ems's `--sigma`) with openEMS's conductor-loss model on flat primitives, PEC on others and next to the boundaries, as openEMS's; with `roughness` (m RMS, gfdtd's own) rough copper |
 | Primitives | Box, Polygon, LinPoly, Cylinder, CylindricalShell, Curve (a wire along the mesh edges nearest to it, as openEMS's) |
 | Lumped elements | R, L, C: parallel, or series RLC (`LEtype=1`), with metal caps |
 | Ports | all of openEMS's Python ports: lumped, curve, microstrip (MSL), stripline, CPW, coaxial, rectangular and circular waveguide, any waveguide mode by functions or mode file ([Ports](#ports)) |
@@ -149,6 +149,13 @@ V   = vv * V + vi * (loop sum of I around the dual face)  from C = eps A' / l, G
   halved on the sheet's border, and the edge's capacitance is openEMS's stabilising one. The branches are poles
   like the Debye ones but driven by the voltage, L di/dt + R i = V: i' = ka i + kb (V' + V), integrated with the
   trapezoidal rule and folded into the E update the same way (openEMS updates them explicitly).
+- **Rough copper** (`ConductingSheet(..., roughness=)`, m RMS; gfdtd's, written to the XML as `Roughness`, which
+  openEMS reads past): the sheet's resistance per square times Hammerstad and Jensen's factor
+  1 + 2/pi atan(1.4 (rms / delta)^2), fitted from f_max / 10^4 to 2 f_max as a passive R-L impedance on ten time
+  constants (non-negative least squares, the reactance weighted 0.05: the factor scales the loss, and the fit
+  gives the reactance a causal surface has), then turned into admittance branches (7–9 of them) for the edges.
+  The fit is within 2 % in resistance over the band and exact at DC. On a 40 mm copper microstrip with 1 µm RMS
+  the conductor loss rose by 1.43× at 2.5 GHz and 1.84× at 18.5 GHz, against Hammerstad's 1.43 and 1.89.
 - **PML:** CPML (kappa 1, no alpha) with a cubic grading and R0 = 1e-6 over the PML_n cells. Each slab keeps
   two auxiliary terms per field along its axis; corners take both slabs' terms. The grading is the stretched
   coordinate's, the same for E and H, so the PML matches any dielectric that runs into it.
