@@ -6,8 +6,8 @@ files, so a model made for openEMS runs here unchanged:
     from gfdtd import ContinuousStructure, openEMS          # instead of CSXCAD's / openEMS's
     python -m gfdtd model.xml                                # an openEMS XML file, as `openEMS model.xml`
 
-What it models (the MVP): rectilinear grids; isotropic dielectrics with conductivity (kappa); metals and
-conducting sheets as PEC; lumped elements (R, L, C, parallel or series, with caps); openEMS's ports (lumped, MSL, stripline, CPW, coaxial,
+What it models (the MVP): rectilinear grids; isotropic dielectrics with conductivity (kappa); metals as PEC,
+conducting sheets with conductor loss (openEMS's model); lumped elements (R, L, C, parallel or series, with caps); openEMS's ports (lumped, MSL, stripline, CPW, coaxial,
 rectangular / circular / any waveguide, curve); a Gaussian excitation, soft or hard, E or H, weighted and delayed;
 PEC, PMC, Mur and PML boundaries; Debye materials; voltage, current and mode-matching probes; field dumps; NF2FF; the
 energy end criterion; ABORT files.
@@ -27,9 +27,11 @@ kicad2ems's models here): a minor release adds to it, a major one removes or cha
     engine.resolve_backend(name)                 'cupy', 'core' or 'numpy' for 'auto', 'gpu', 'cpu', ...
     engine.concurrent_runs(cells, runs)          how many runs to have on the GPU at once
     __version__
+    1.1: conducting sheets are lossy (openEMS's model), no longer PEC
+    1.2: ConductingSheet(roughness=): rough copper (m RMS, Hammerstad's loss factor, a wideband fit)
 """
-__version__ = '261102-r1'
-API_VERSION = (1, 0)
+__version__ = '261104-r1'
+API_VERSION = (1, 2)
 
 from .csx import ContinuousStructure                                # noqa: E402,F401
 from .fdtd import openEMS, LumpedPort                               # noqa: E402,F401

@@ -329,9 +329,10 @@ def test_debye_material_matches_its_value_at_one_frequency(tmp_path):
     assert abs(za[0] - zb[0]) > 0.1 * abs(zb[0])                      # dispersive: other values elsewhere
 
 
-def _plate_wave(tmp_path, n, bc, backend='numpy', dumps=(), debye=False):
+def _plate_wave(tmp_path, n, bc, backend='numpy', dumps=(), debye=False, sheet=False):
     """A radial wave between two PEC plates (z: 2 cells, 1 mm cells), from a source column at the centre of an n x n
-    cell domain; the voltage at 15 mm along x. Returns (t, u, run folder, the openEMS object)."""
+    cell domain; the voltage at 15 mm along x. sheet: a resistive conducting sheet across the gap's middle plane
+    beside the source. Returns (t, u, run folder, the openEMS object)."""
     F = openEMS(NrTS=330, EndCriteria=1e-9)
     F.SetGaussExcite(10e9, 10e9)
     F.SetBoundaryCond([bc] * 4 + ['PEC', 'PEC'])
@@ -349,6 +350,8 @@ def _plate_wave(tmp_path, n, bc, backend='numpy', dumps=(), debye=False):
         m = csx.AddDebyeMaterial('slab', order=1, epsilon=2.0)
         m.SetDispersiveMaterialProperty(order=0, eps_delta=1.0, eps_relax=20e-12)
         m.AddBox([-8, -8, 0], [8, 8, 2], priority=1)
+    if sheet:                                                       # thin and poor: a few ohms per square
+        csx.AddConductingSheet('sheet', conductivity=1e5, thickness=1e-6).AddBox([4, -10, 1], [12, 10, 1], priority=5)
     for name, kw, box in dumps:
         csx.AddDump(name, **kw).AddBox(*box)
     path = str(tmp_path / f"{bc}_{n}_{backend}")
@@ -448,13 +451,180 @@ def test_compressed_operator_gives_the_dense_coefficients(tmp_path):
         np.testing.assert_allclose(geoH, op.iv[a], rtol=2e-6, atol=1e-30)
 
 
+def test_compressed_operator_keeps_the_sheet_poles_apart(tmp_path):
+    """A Debye material and a conducting sheet: three poles, the sheet's two with sg -1 in h's second half."""
+    from gfdtd.operator import compress
+    _, _, _, F = _plate_wave(tmp_path, 30, 'PML_8', debye=True, sheet=True)
+    c = compress(F.op)
+    assert c.P == 3 and len(c.h) == 6 and sorted(c.h[3:]) == [-1, -1, 1]
+    np.testing.assert_allclose(np.moveaxis(c.vv[c.code], -1, 0), F.op.vv, atol=2e-6)
+
+
+def _sheet_model(prim='box', sigma=5.8e7, t=35e-6, bc='MUR'):
+    """A 10 x 6 mm sheet on z = 1 in a 1 mm grid (0.5 mm in y)."""
+    F = openEMS(NrTS=10, EndCriteria=1e-9)
+    F.SetGaussExcite(5e9, 5e9)
+    F.SetBoundaryCond([bc] * 6)
+    csx = ContinuousStructure()
+    F.SetCSX(csx)
+    g = csx.GetGrid()
+    g.SetDeltaUnit(1e-3)
+    g.SetLines('x', np.arange(-8, 8.01, 1.0))
+    g.SetLines('y', np.arange(-5, 5.01, 0.5))
+    g.SetLines('z', np.arange(-2, 4.01, 1.0))
+    sh = csx.AddConductingSheet('cu', conductivity=sigma, thickness=t)
+    if prim == 'box':
+        sh.AddBox([-5, -3, 1], [5, 3, 1], priority=1)
+    elif prim == 'polygon':
+        sh.AddPolygon(np.array([[-5, -3], [5, -3], [5, 3], [-5, 3]]).T, 'z', 1, priority=1)
+    else:
+        sh.AddLinPoly(np.array([[-5, -3], [5, -3], [5, 3], [-5, 3]]).T, 'z', 1, 0.5, priority=1)
+    return F, csx
+
+
+@pytest.mark.parametrize('prim', ['box', 'polygon'])
+def test_conducting_sheet_edges_are_openems_model(prim):
+    """Each sheet edge: G = G_sq / f / w, R-L branches R_sq f w, tau the sheet's, C openEMS's, w = (edge length) /
+    (node width across it), f = 2 on the border; no PEC left on it."""
+    from gfdtd.operator import build
+    from gfdtd import sheet
+    F, csx = _sheet_model(prim)
+    op = build(csx, F.settings())
+    G, R1, L1, R2, L2, ok = sheet.per_square(5.8e7, 35e-6, 10e9)
+    assert ok and op.n_sheet == 10 * 13 + 11 * 12 and sum(op.n_pec) == 0
+    idx, ka, kb, sg = op.debye
+    assert set(sg) == {-1.0} and len(np.unique(ka)) == 2
+    dt, sh = op.dt, op.shape
+    x, y, z = (list(np.round(l, 6)) for l in op.grid.lines)
+    for a, ijk, w, f in ((0, (x.index(0), y.index(0), z.index(1)), 1e-3 / 0.5e-3, 1),      # inside: x edge, y width
+                         (0, (x.index(0), y.index(3), z.index(1)), 1e-3 / 0.5e-3, 2),      # on the border y = 3
+                         (1, (x.index(0), y.index(0), z.index(1)), 0.5e-3 / 1e-3, 1)):     # inside: y edge
+        e = np.ravel_multi_index((a,) + ijk, (3,) + sh)
+        mine = idx == e
+        assert mine.sum() == 2
+        tau = (1 + ka[mine]) / (1 - ka[mine]) * dt / 2                   # back from ka = (2 tau - dt) / (2 tau + dt)
+        R = dt / (kb[mine] * (2 * tau + dt))                            # and kb = dt / (R (2 tau + dt))
+        got = sorted(zip(tau, R))
+        want = sorted([(L1 / R1, R1 * f * w), (L2 / R2, R2 * f * w)])
+        np.testing.assert_allclose(np.array(got), np.array(want), rtol=1e-7)
+        Lmin = min(L1, L2) * f * w
+        cap = dt * dt / 4 * (16 / Lmin + 1 / (L1 * f * w) + 1 / (L2 * f * w))
+        kbs = kb[mine].sum()
+        den = cap + G / f / w * dt / 2 + kbs * dt / 2
+        np.testing.assert_allclose(op.vi.reshape(-1)[e], dt / den, rtol=1e-9)
+        np.testing.assert_allclose(op.vv.reshape(-1)[e], (cap - G / f / w * dt / 2 - kbs * dt / 2) / den, rtol=1e-9)
+
+
+def test_rough_sheet_fit_is_passive_and_follows_hammerstad():
+    """fit_rough: R-L branches (passive) whose resistance is Hammerstad's factor x the smooth sheet's within 2 %
+    from f_max / 100 to f_max, and the sheet's sigma t at DC."""
+    from gfdtd import sheet
+    f = np.logspace(np.log10(20e9) - 2, np.log10(20e9), 60)
+    for t, rms in ((18e-6, 0.5e-6), (35e-6, 1e-6), (70e-6, 3e-6)):
+        G, br = sheet.fit_rough(5.8e7, t, 20e9, rms)
+        assert G >= 0 and br and all(R > 0 and tau > 0 for R, tau in br)
+        Y = G + sum(1 / (R + 2j * np.pi * f * R * tau) for R, tau in br)
+        want = sheet.z_square(f, 5.8e7, t).real * sheet.hammerstad(f, rms, 5.8e7)
+        np.testing.assert_allclose((1 / Y).real, want, rtol=0.02)
+        assert G + sum(1 / R for R, _ in br) == pytest.approx(5.8e7 * t, rel=0.01)
+
+
+def test_rough_sheet_in_the_operator_and_xml(tmp_path):
+    """roughness: more R-L poles on the sheet's edges, kept through openEMS's XML (an attribute openEMS reads past),
+    and the core runs it as numpy does."""
+    from gfdtd.operator import build
+    F, csx = _sheet_model()
+    csx.GetAllProperties()[0].roughness = 1e-6
+    op = build(csx, F.settings())
+    idx, ka, kb, sg = op.debye
+    assert set(sg) == {-1.0} and len(np.unique(ka)) > 2 and any('RMS rough' in n for n in op.notes)
+    F.Write2XML(str(tmp_path / 'm.xml'))
+    G = openEMS()
+    G.ReadFromXML(str(tmp_path / 'm.xml'))
+    assert G.csx.GetAllProperties()[0].roughness == pytest.approx(1e-6)
+    if core_info()[0]:
+        _, a, _, Fa = _plate_wave(tmp_path / 'n', 30, 'MUR', 'numpy', sheet=True)
+        for p in Fa.csx.GetAllProperties():
+            if type(p).__name__ == 'ConductingSheet':
+                p.roughness = 0.5e-6
+        _, a, _, _ = _plate_wave_with(tmp_path / 'n2', Fa, 'numpy')
+        _, b, _, _ = _plate_wave_with(tmp_path / 'c2', Fa, 'core')
+        np.testing.assert_allclose(a, b, atol=1e-5 * np.abs(a).max())
+
+
+def _plate_wave_with(path, F, backend):
+    """Run openEMS object F (a _plate_wave model) again in `path` on `backend`."""
+    from gfdtd.fdtd import read_probe
+    F.Run(str(path), cleanup=True, verbose=0, backend=backend)
+    t, u = read_probe(os.path.join(str(path), 'ut'))
+    return t, u, str(path), F
+
+
+def test_conducting_sheet_falls_back_to_pec():
+    """openEMS's rules: a sheet on a 3D primitive, or with no thickness, is PEC; so are sheet edges next to a
+    Mur boundary (its two outer lines)."""
+    from gfdtd.operator import build
+    F, csx = _sheet_model('linpoly')
+    op = build(csx, F.settings())
+    assert op.n_sheet == 0 and sum(op.n_pec) > 0 and any('not flat' in n for n in op.notes)
+    F, csx = _sheet_model(t=0.0)
+    op = build(csx, F.settings())
+    assert op.n_sheet == 0 and sum(op.n_pec) == 10 * 13 + 11 * 12 and any('zero conductivity' in n for n in op.notes)
+    F, csx = _sheet_model()
+    csx.GetGrid().SetLines('y', np.arange(-3.5, 3.51, 0.5))             # the sheet's border now one line inside
+    op = build(csx, F.settings())
+    assert op.n_sheet > 0 and sum(op.n_pec) > 0
+
+
+def _msl_energy(kind, steps, every=100):
+    """A 10 mm microstrip (0.4 mm on 0.2 mm, Mur walls), 50 ohm at the fed end, open at the other: its energy every
+    `every` steps on the core, and the sample where the pulse ends. kind: 'pec' or 'sheet' (35 um copper)."""
+    from gfdtd.operator import build
+    from gfdtd.engine import make_backend
+    L, w, h = 10.0, 0.4, 0.2
+    F = openEMS(NrTS=10, EndCriteria=1e-9)
+    F.SetGaussExcite(10e9, 10e9)
+    F.SetBoundaryCond(['MUR'] * 6)
+    csx = ContinuousStructure()
+    F.SetCSX(csx)
+    g = csx.GetGrid()
+    g.SetDeltaUnit(1e-3)
+    g.SetLines('x', np.arange(-L / 2 - 2, L / 2 + 2.01, 0.25))
+    g.SetLines('y', np.unique(np.r_[np.arange(-3, 3.01, 0.25), -w / 2, w / 2]))
+    g.SetLines('z', np.unique(np.r_[-0.5, np.linspace(0, h, 3), np.arange(h, h + 2.01, 0.25)]))
+    csx.AddMaterial('sub', epsilon=3.66).AddBox([-9, -9, 0], [9, 9, h], priority=1)
+    m = csx.AddMetal('cu') if kind == 'pec' else csx.AddConductingSheet('cu', conductivity=5.8e7, thickness=35e-6)
+    m.AddBox([-L / 2, -w / 2, h], [L / 2, w / 2, h], priority=10)
+    m.AddBox([-9, -9, 0], [9, 9, 0], priority=10)
+    csx.AddLumpedElement('r1', ny='z', caps=True, R=50).AddBox([-L / 2, -w / 2, 0], [-L / 2, w / 2, h], priority=5)
+    csx.AddExcitation('src', exc_type=0, exc_val=[0, 0, 1]).AddBox([-L / 2, 0, 0], [-L / 2, 0, h])
+    op = build(csx, F.settings())
+    be = make_backend(op, 'core')
+    W = []
+    for n in range(steps):
+        be.step(op.signal[n] if n < len(op.signal) else None)
+        if n % every == 0:
+            W.append(float(be.energy()))
+    return np.array(W), len(op.signal) // every
+
+
+@pytest.mark.skipif(not core_info()[0], reason='no compiled CPU core (python -m gfdtd.core.build)')
+def test_conducting_sheets_stay_stable():
+    """Copper sheets on an open microstrip: after the pulse the energy falls by nine orders of magnitude and keeps
+    falling (no late-time growth; checked to 120,000 steps by hand)."""
+    W, n0 = _msl_energy('sheet', 20000)
+    pk = W.max()
+    q = [x.max() / pk for x in np.array_split(W[n0 + 20:], 4)]
+    assert q[1] < 1e-6 and q[3] <= q[1]
+
+
 @pytest.mark.skipif(not core_info()[0], reason='no compiled CPU core (python -m gfdtd.core.build)')
 def test_core_matches_numpy_with_pml_debye_and_dumps(tmp_path):
     from gfdtd.engine import resolve_backend, core_threads
     assert resolve_backend('cpu') == 'core' and 1 <= core_threads() <= (os.cpu_count() or 1)
     for bc in ('PML_8', 'MUR'):
-        _, a, pa, _ = _plate_wave(tmp_path / 'n', 50, bc, 'numpy', dumps=DUMPS[1:2], debye=True)
-        _, b, pb, _ = _plate_wave(tmp_path / 'c', 50, bc, 'core', dumps=DUMPS[1:2], debye=True)
+        _, a, pa, _ = _plate_wave(tmp_path / 'n', 50, bc, 'numpy', dumps=DUMPS[1:2], debye=True, sheet=True)
+        _, b, pb, _ = _plate_wave(tmp_path / 'c', 50, bc, 'core', dumps=DUMPS[1:2], debye=True, sheet=True)
         np.testing.assert_allclose(a, b, atol=1e-5 * np.abs(a).max())
         fa, fb = read_fd(os.path.join(pa, 'Ef.h5'))[1][0][1], read_fd(os.path.join(pb, 'Ef.h5'))[1][0][1]
         np.testing.assert_allclose(fa, fb, atol=1e-4 * np.abs(fa).max())
@@ -554,8 +724,8 @@ def test_gpu_matches_numpy_with_pml_debye_and_dumps(tmp_path, monkeypatch, mode,
     apart), and its dump kernel (every field and dump mode), against numpy."""
     import glob
     monkeypatch.setenv('GFDTD_STEP', mode)
-    _, a, pa, _ = _plate_wave(tmp_path, 50, 'PML_8', 'numpy', dumps=DUMPS + NODE_DUMPS, debye=True)
-    _, b, pb, F = _plate_wave(tmp_path, 50, 'PML_8', gpu, dumps=DUMPS + NODE_DUMPS, debye=True)
+    _, a, pa, _ = _plate_wave(tmp_path, 50, 'PML_8', 'numpy', dumps=DUMPS + NODE_DUMPS, debye=True, sheet=True)
+    _, b, pb, F = _plate_wave(tmp_path, 50, 'PML_8', gpu, dumps=DUMPS + NODE_DUMPS, debye=True, sheet=True)
     np.testing.assert_allclose(a, b, atol=1e-5 * np.abs(a).max())
     for f in glob.glob(os.path.join(pa, '*.h5')):
         fa, fb = read_fd(f)[1][0][1], read_fd(f.replace(pa, pb))[1][0][1]
@@ -615,7 +785,7 @@ def test_api_version_and_its_names():
     import inspect
     import gfdtd
     from gfdtd import engine
-    assert gfdtd.API_VERSION == (1, 0)
+    assert gfdtd.API_VERSION == (1, 2)
     assert 'backend' in inspect.signature(gfdtd.openEMS).parameters and gfdtd.ContinuousStructure
     for name, args in (('gpu_info', []), ('core_info', []), ('resolve_backend', ['name']),
                        ('concurrent_runs', ['cells', 'runs'])):

@@ -8,8 +8,9 @@
 //
 // Fields V, I: float32 (3, nx, ny, nz), z fastest. The compressed operator (operator.Compressed): per node a
 // code into tables vv / s / pole of its three E edges ([code * 3 + a]); vi = ke * d_a / (dual_b dual_c) * s and iv = kh * dual_a / (d_b d_c) from the
-// line arrays G = [d | 1/d | dual | 1/dual], each [x | y | z]. Debye pole currents (scaled, i~) in pol
-// (nslot, 3, P), the node's row in slot (-1: none).
+// line arrays G = [d | 1/d | dual | 1/dual], each [x | y | z]. Pole currents (scaled, i~) in pol
+// (nslot, 3, P), the node's row in slot (-1: none): i~' = ka i~ + kb~ (V' - sg V), th = [h | sg] (2P): sg 1 for a
+// Debye pole, -1 for a conducting sheet's R-L branch.
 #ifndef GF_DEV
 #define GF_DEV inline
 #endif
@@ -86,7 +87,7 @@ GF_DEV void gf_e_comp(int a, idx_t t, float c, float geo, float* V, const C* cod
             sum += th[p] * ip[p];
         v -= dt * s * sum;
         for (int p = 0; p < P; ++p)
-            ip[p] = tka[p] * ip[p] + kb[p] * (v - v0);
+            ip[p] = tka[p] * ip[p] + kb[p] * (v - th[P + p] * v0);
     }
     V[a * n + t] = v;
 }
@@ -245,7 +246,7 @@ GF_SIMD
         const float v = Vr[k] - dt * s * sum;
         Vr[k] = v;
         for (int p = 0; p < P; ++p)
-            ip[p] = tka[p] * ip[p] + kb[p] * (v - old[k]);
+            ip[p] = tka[p] * ip[p] + kb[p] * (v - th[P + p] * old[k]);
     }
 }
 
