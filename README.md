@@ -68,7 +68,7 @@ Stop and S-parameter code among them) work on gfdtd unchanged.
 | Grid | rectilinear, Cartesian |
 | Materials | isotropic epsilon and conductivity (kappa), averaged over the four cells around each edge |
 | Dispersion | Debye materials (`DebyeMaterial`, any number of poles): `--diel wideband` |
-| Metal | `Metal` and `ConductingSheet`, both as PEC: no conductor loss (`--sigma` is ignored) |
+| Metal | `Metal` as PEC; `ConductingSheet` (conductivity, thickness: kicad2ems's `--sigma`) with openEMS's conductor-loss model on flat primitives, PEC on others and next to the boundaries, as openEMS's |
 | Primitives | Box, Polygon, LinPoly, Cylinder, CylindricalShell, Curve (a wire along the mesh edges nearest to it, as openEMS's) |
 | Lumped elements | R, L, C: parallel, or series RLC (`LEtype=1`), with metal caps |
 | Ports | all of openEMS's Python ports: lumped, curve, microstrip (MSL), stripline, CPW, coaxial, rectangular and circular waveguide, any waveguide mode by functions or mode file ([Ports](#ports)) |
@@ -80,7 +80,7 @@ Stop and S-parameter code among them) work on gfdtd unchanged.
 | Far field | openEMS's NF2FF box (`CreateNF2FFBox`, `CalcNF2FF`), frequency domain, PEC / PMC mirrors: antenna mode |
 | End | the energy in the field and in the lumped parts (`EndCriteria`), timestep limit, `ABORT` |
 
-Not yet: conductor loss (`--sigma`: conducting sheets run as PEC), Lorentz materials, time-domain NF2FF,
+Not yet: Lorentz materials, time-domain NF2FF,
 `--converge`, the mode-purity column of
 mode-matching probes, field probes (types 2, 3), and cylindrical grids. A file that holds these is still read:
 what gfdtd doesn't model is listed as a note.
@@ -142,6 +142,13 @@ V   = vv * V + vi * (loop sum of I around the dual face)  from C = eps A' / l, G
 - **Debye poles:** each pole is a polarisation current on its edges, tau di/dt + i = C_p dV/dt
   (C_p = eps0 eps_delta A′ / l, averaged like epsilon). It is integrated with the trapezoidal rule at the E
   update's time, which folds part of it into vv and vi: stable for any tau.
+- **Conducting sheets** (`src/gfdtd/sheet.py`): openEMS's model. A sheet of conductivity sigma and thickness t
+  gives each of its edges a conductance and two series R-L branches in parallel, fitted to the sheet's
+  skin-effect impedance up to f0 + fc (openEMS's table: both faces carry current, so the sheet stands for a
+  conductor of thickness t). Per square they scale to the edge by its length over the node's width across it,
+  halved on the sheet's border, and the edge's capacitance is openEMS's stabilising one. The branches are poles
+  like the Debye ones but driven by the voltage, L di/dt + R i = V: i' = ka i + kb (V' + V), integrated with the
+  trapezoidal rule and folded into the E update the same way (openEMS updates them explicitly).
 - **PML:** CPML (kappa 1, no alpha) with a cubic grading and R0 = 1e-6 over the PML_n cells. Each slab keeps
   two auxiliary terms per field along its axis; corners take both slabs' terms. The grading is the stretched
   coordinate's, the same for E and H, so the PML matches any dielectric that runs into it.
@@ -165,8 +172,10 @@ run the same update code (`src/gfdtd/core/fdtd_core.h`) on the **compressed oper
   three E edges: 8 bits, or 16 / 32 past 255 / 65535 codes. All nodes of one material (or one quarter-cell mix
   at an interface) share a code; the example boards need 40–60. This cuts each cell update from 108 to 73 bytes
   of memory traffic.
-- The **Debye poles** are folded into the E update: one pass, no extra kernels. The pole currents are stored
-  only for the nodes that have them, scaled so that their coefficients don't depend on the geometry either.
+- The **poles** (Debye, and the conducting sheets' R-L branches) are folded into the E update: one pass, no extra
+  kernels. The pole currents are stored only for the nodes that have them, scaled so that their coefficients
+  don't depend on the geometry either. A pole's update is i' = ka i + kb (V' - sg V), with sg 1 (Debye) or -1
+  (R-L) in the second half of the table that holds each pole's (1 + ka) / 2.
 - The table is exact to 2^-20 (vv and s are rounded so that equal values match).
 
 The four backends:
@@ -222,6 +231,14 @@ material. The PML agrees with openEMS's PML to 0.02 in S11 and 0.005 in S21. In 
 through an 8-cell PML is within 5e-5 of the peak of a reflection-free reference, against 6 % for Mur. Dump
 grids are openEMS's exactly. Values agree within ~3 %, of which 1.8 % is the incident wave itself (the maps
 are scaled to 1 V incident).
+
+**Conductor loss.** A 40 mm microstrip (0.4 mm wide on 0.2 mm, eps_r 3.66, lumped 50 ohm ports), strip and ground
+as 35 µm copper conducting sheets, 0.5–20 GHz, one XML run on both engines (`tools/sheet_vs_openems.py`). gfdtd
+and openEMS 0.37 agree to |ΔS21| ≤ 0.009, mostly 0.002–0.004, and |ΔS11| ≤ 0.04. The sheets add 0.05 dB of
+loss at 0.5 GHz, rising with about the square root of frequency to 0.33 dB at 20 GHz. openEMS's energy stalled
+at −24.7 dB, and it ran its 200,000 timesteps (235 s, 2 threads); gfdtd's fell to −40 dB at 4,700 (4 s on the
+CPU core, 2 cores). In the tests, copper sheets on an open microstrip keep losing energy to 10⁻¹¹ of the peak over
+120,000 timesteps.
 
 rf_coupler with `--bc PML_8 --diel wideband --dump ...`: max |ΔS| 0.004 against openEMS. openEMS took 235 s;
 gfdtd took 11 s on the GPU and 49 s on the CPU core (1.27 M cells).

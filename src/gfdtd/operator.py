@@ -13,13 +13,16 @@ at y_j, z_k; H_x[i, j, k] sits at x_i, y_j+1/2, z_k+1/2. Indices past the last e
     op = build(csx, fdtd)        # fdtd: dict(bc=[6], f0, fc, nr_ts, end_crit, oversampling)
 
 Materials are sampled at cell centres (highest priority wins) and averaged over the four quarter cells around
-each edge. Metals (Metal, ConductingSheet: both as PEC) take the edges whose midpoint is in a primitive; flat
-primitives snap to the nearest mesh line. Lumped elements spread their R / L / C over the edges in their box
+each edge. Metals take the edges whose midpoint is in a primitive; flat primitives snap to the nearest mesh line.
+Metal is PEC; a ConductingSheet on a flat primitive is openEMS's conducting-sheet model (gfdtd.sheet: a
+conductance and two R-L branches per edge, fitted to the sheet's skin-effect impedance up to f0 + fc), PEC on
+other primitives and next to the boundaries, as openEMS's. Lumped elements spread their R / L / C over the edges in their box
 (parallel, or series RLC on each edge), with metal caps; soft E excitations add exc_val x signal to their edges.
 
 Debye materials: each pole is a polarisation current i on the edges, tau di/dt + i = C_p dV/dt (C_p = eps0
 eps_delta A' / l), integrated with the trapezoidal rule at the E update's time, which folds part of it into vv
-and vi: unconditionally stable, for any tau. PML_n: the n outermost cells of a side are a convolutional PML
+and vi: unconditionally stable, for any tau. A conducting sheet's R-L branches are poles too, L di/dt + R i = V,
+integrated the same way: i' = ka i + kb (V' - sg V), sg 1 for Debye, -1 for R-L. PML_n: the n outermost cells of a side are a convolutional PML
 (CPML, kappa 1, no alpha) with a cubic conductivity grading, ending in PEC. Dumps: DumpBox regions at the cell
 centres (openEMS's dump mode 2), worked out by the engine.
 """
@@ -283,6 +286,84 @@ def _clipped_weights(grid, b, i0, i1, lo, hi):
     return w / w.sum() if w.sum() > 0 else np.full(len(w), 1.0 / len(w))
 
 
+def _sheet_normal(q):
+    """The normal axis of a flat primitive (a Polygon, or a Box flat along one axis), else None: openEMS models a
+    conducting sheet on 2D primitives only (PEC on the others)."""
+    if isinstance(q, C.LinPoly) or isinstance(q, C.Curve):
+        return None
+    if isinstance(q, C.Polygon):
+        return int(q.norm_dir)
+    if isinstance(q, C.Box):
+        flat = [a for a in range(3) if q.start[a] == q.stop[a]]
+        return flat[0] if len(flat) == 1 else None
+    return None
+
+
+def _bc_size(b):
+    """openEMS's boundary size (cells) of a side: 1 for Mur, n for PML_n, else 0."""
+    b = str(b).upper()
+    if b == 'MUR':
+        return 1
+    if b.startswith('PML'):
+        return int(b.split('_')[1]) if '_' in b else 8
+    return 0
+
+
+def _sheet_edges(sheets, sheet_of, sheet_m, grid, lE, dt, f_max, notes):
+    """openEMS's conducting-sheet model (gfdtd.sheet) on the edges in sheet_m: (flat edge indices, C, G,
+    [(R1, L1), (R2, L2)]), each per edge, or None. A sheet of conductivity sigma and thickness t gives the edge
+    the conductance G = G_sq / f / w and two series R-L branches R_k = R_k,sq f w, L_k = L_k,sq f w in parallel,
+    w = (edge length) / (node width across it), f = 2 on the sheet's border (half the width covered). Its C is
+    openEMS's, dt^2 / 4 (16 / min(L) + 1 / L1 + 1 / L2), in place of the dielectric's. The branches come back
+    as (R, tau = L / R): tau is the sheet's, so that one sheet's poles share their two relaxations exactly."""
+    from . import sheet as S
+    if not sheet_m.any():
+        return None
+    sh = sheet_m.shape[1:]
+    par = np.array([S.per_square(p.conductivity, p.thickness, f_max)[:5] for p, _ in sheets])   # (nsheet, 5)
+    nrm = np.array([n for _, n in sheets])
+    tau = np.stack([par[:, 2] / par[:, 1], par[:, 4] / par[:, 3]], 1)
+    for (p, _), ok in zip(sheets, [S.per_square(p.conductivity, p.thickness, f_max)[5] for p, _ in sheets]):
+        if not ok:
+            notes.append(f"conducting sheet {p.name}: {p.thickness * 1e6:g} um at {p.conductivity:g} S/m is past the "
+                         f"model's fit at {f_max / 1e9:g} GHz (openEMS's last row used, as openEMS does)")
+    idx, cap, cond, R1, L1, R2, L2 = ([] for _ in range(7))
+    for a in range(3):
+        ijk = np.nonzero(sheet_m[a])
+        if not len(ijk[0]):
+            continue
+        sid = sheet_of[a][ijk]
+        t = 3 - a - nrm[sid]                                        # the sheet's other in-plane axis
+        if np.any(nrm[sid] == a):
+            raise ValueError("gfdtd: a conducting sheet owns an edge along its normal")
+        width = np.choose(t, [grid.dual[b][ijk[b]] for b in range(3)])
+        w = lE[a][ijk] / width
+        f = np.ones(len(sid))
+        for b in range(3):                                          # the edges across it at its node and the one before
+            sel = t == b
+            if not sel.any():
+                continue
+            here = tuple(c[sel] for c in ijk)
+            prev = list(here)
+            prev[b] = here[b] - 1
+            has_prev = prev[b] >= 0
+            prev[b] = np.maximum(prev[b], 0)
+            border = ~sheet_m[b][here] | ~(sheet_m[b][tuple(prev)] & has_prev)
+            f[np.nonzero(sel)[0][border]] = 2.0
+        g, r1, l1, r2, l2 = (par[sid, n] for n in range(5))
+        l1e, l2e = l1 * f * w, l2 * f * w
+        idx.append(np.ravel_multi_index((np.full(len(sid), a),) + ijk, (3,) + sh))
+        cond.append(g / f / w)
+        cap.append(dt * dt / 4 * (16 / np.minimum(l1e, l2e) + 1 / l1e + 1 / l2e))
+        R1.append(r1 * f * w), R2.append(r2 * f * w)
+        L1.append(tau[sid, 0]), L2.append(tau[sid, 1])                 # tau = L / R: the same for every edge
+    cat = lambda v: np.concatenate(v)
+    for p in {id(p): p for p, _ in sheets}.values():
+        notes.append(f"conducting sheet {p.name}: {p.conductivity:g} S/m, {p.thickness * 1e6:g} um (openEMS's model, "
+                     f"fitted to {f_max / 1e9:g} GHz)")
+    return (cat(idx).astype(np.int64), cat(cap), cat(cond), [(cat(R1), cat(L1)), (cat(R2), cat(L2))])  # (R, tau)
+
+
 def build(csx, fdtd, log=None):
     """The Operator of a ContinuousStructure (gfdtd.csx, or anything with the same attributes) and the FDTD
     settings dict(bc, f0, fc, nr_ts, end_crit, oversampling)."""
@@ -316,11 +397,26 @@ def build(csx, fdtd, log=None):
             epsE[a] = _edge_average(eps, a, grid)
             cap[a] = np.where(lE[a] > 0, EPS0 * epsE[a] * aE[a] / lE[a], 0.0)
             cond[a] = np.where(lE[a] > 0, _edge_average(kap, a, grid) * aE[a] / lE[a], 0.0)
-    # metals: edges whose midpoint is in a primitive, by priority
+    # metals: edges whose midpoint is in a primitive, by priority. sheet_of: the conducting sheet (an index into
+    # sheets: (property, normal axis)) that owns the edge, -1 for PEC
     pec = np.full((3,) + sh, -np.inf)
+    sheet_of = np.full((3,) + sh, -1, np.int32)
+    sheets = []
     for p in props:
         if isinstance(p, (C.Metal, C.ConductingSheet)):
             for q in p.primitives:
+                sid = -1
+                if isinstance(p, C.ConductingSheet):
+                    nrm, why = _sheet_normal(q), None
+                    if nrm is None:
+                        why = f"a {type(q).__name__} is not flat"
+                    elif not (p.conductivity > 0 and p.thickness > 0):
+                        why = "zero conductivity or thickness"
+                    if why:
+                        op.notes.append(f"conducting sheet {p.name}: {why}, modelled as PEC")
+                    else:
+                        sid = len(sheets)
+                        sheets.append((p, nrm))
                 if isinstance(q, C.Curve):
                     for a, ijk in curve_edges(q, grid):
                         if ijk[a] < sh[a] - 1:
@@ -328,9 +424,8 @@ def build(csx, fdtd, log=None):
                     continue
                 for a in range(3):
                     m = edge_mask(q, a, grid)
+                    sheet_of[a][m & (q.priority > pec[a])] = sid
                     np.maximum(pec[a], np.where(m, q.priority, -np.inf), out=pec[a])
-    if any(isinstance(p, C.ConductingSheet) for p in props):
-        op.notes.append("conducting sheets are modelled as PEC (no conductor loss)")
     # lumped elements: parallel R / C into G / C of the edges, parallel L and series RLC as edge branches
     op.par_L, op.series = [], []
     lumped = [(q.priority, p, q) for p in props if isinstance(p, C.LumpedElement) for q in p.primitives]
@@ -380,13 +475,35 @@ def build(csx, fdtd, log=None):
                         for ui in range(u0, u1 + 1):
                             idx = [0, 0, 0]
                             idx[a], idx[t], idx[u] = line, ti, ui
+                            if pr >= pec[t][tuple(idx)]:
+                                sheet_of[t][tuple(idx)] = -1
                             pec[t][tuple(idx)] = max(pec[t][tuple(idx)], pr)
     pec_m = pec > -np.inf
-    op.n_pec = [int(pec_m[a].sum()) for a in range(3)]
     dt = op.dt
-    # Debye poles: i' = ka i + kb (V' - V); the E update sees (i + i') / 2, so kb / 2 joins the edge's C / dt
-    kb_sum = np.zeros((3,) + sh)
-    op.debye = []                                                   # (flat edge, ka, kb) of every pole on every edge
+    # conducting sheets: openEMS's model on the edges a sheet owns; PEC near the boundaries, as openEMS's
+    sheet_m = pec_m & (sheet_of >= 0)
+    if sheet_m.any():
+        bcn = [_bc_size(b) for b in fdtd['bc']]
+        near = np.zeros(sh, bool)
+        for b in range(3):
+            sl = [None] * 3
+            sl[b] = slice(None)
+            k = np.arange(sh[b])
+            near |= ((k <= bcn[2 * b]) | (k >= sh[b] - bcn[2 * b + 1] - 1))[tuple(sl)]
+        sheet_m &= ~near[None]
+        sheet_of[~sheet_m] = -1
+    pec_m &= ~sheet_m                                               # from here on: PEC only
+    op.n_pec = [int(pec_m[a].sum()) for a in range(3)]
+    op.n_sheet = int(sheet_m.sum())
+    rl = _sheet_edges(sheets, sheet_of, sheet_m, grid, lE, dt, float(fdtd['f0']) + float(fdtd['fc']), op.notes)
+    if rl is not None:
+        sidx, s_cap, s_cond = rl[0], rl[1], rl[2]
+        cap.reshape(-1)[sidx], cond.reshape(-1)[sidx] = s_cap, s_cond
+    # poles: i' = ka i + kb (V' - sg V). Debye (sg 1): tau di/dt + i = C_p dV/dt; a sheet's R-L branch (sg -1):
+    # L di/dt + R i = V. Both by the trapezoidal rule; the E update sees (i + i') / 2, so kb / 2 joins the edge's
+    # C / dt in the denominator and sg kb / 2 in the numerator
+    kb_sum, kbs_sum = np.zeros((3,) + sh), np.zeros((3,) + sh)
+    op.debye = []                                                   # (flat edge, ka, kb, sg) of every pole on every edge
     for n, p in enumerate(debye):
         mine = owner == n
         for d_eps, tau in p.pole_list():
@@ -394,21 +511,29 @@ def build(csx, fdtd, log=None):
                 with np.errstate(divide='ignore', invalid='ignore'):
                     cp = np.where(lE[a] > 0, EPS0 * _edge_average(np.where(mine, d_eps, 0.0), a, grid) * aE[a] / lE[a],
                                   0.0)
-                cp[pec_m[a]] = 0.0
+                cp[pec_m[a] | sheet_m[a]] = 0.0
                 nz = np.nonzero(cp > 0)
                 if not len(nz[0]):
                     continue
                 kb = 2 * cp[nz] / (2 * tau + dt)
                 kb_sum[a][nz] += kb
-                op.debye.append((_flat(sh, a, *nz), np.full(len(kb), (2 * tau - dt) / (2 * tau + dt)), kb))
+                kbs_sum[a][nz] += kb
+                op.debye.append((_flat(sh, a, *nz), np.full(len(kb), (2 * tau - dt) / (2 * tau + dt)), kb,
+                                 np.ones(len(kb))))
+    if rl is not None:
+        for R, tau in rl[3]:                                        # L di/dt + R i = V: tau = L / R
+            kb = dt / (R * (2 * tau + dt))
+            kb_sum.reshape(-1)[sidx] += kb
+            kbs_sum.reshape(-1)[sidx] -= kb
+            op.debye.append((sidx, (2 * tau - dt) / (2 * tau + dt), kb, -np.ones(len(kb))))
     if op.debye:
-        idx, ka, kb = (np.concatenate(v) for v in zip(*op.debye))
-        op.debye = (idx.astype(np.int64), ka, kb)
+        idx, ka, kb, sg = (np.concatenate(v) for v in zip(*op.debye))
+        op.debye = (idx.astype(np.int64), ka, kb, sg)
     else:
         op.debye = None
     with np.errstate(divide='ignore', invalid='ignore'):
         den = cap + cond * dt / 2 + kb_sum * dt / 2
-        vv = np.where(den > 0, (cap - cond * dt / 2 + kb_sum * dt / 2) / den, 0.0)
+        vv = np.where(den > 0, (cap - cond * dt / 2 + kbs_sum * dt / 2) / den, 0.0)
         vi = np.where(den > 0, dt / den, 0.0)
         iv = np.where(aH > 0, dt * lH / (MU0 * aH), 0.0)
     vv[pec_m], vi[pec_m] = 0.0, 0.0
@@ -566,13 +691,14 @@ class Compressed:
 
       code    (Nx, Ny, Nz) uint8, uint16 past 255 codes, uint32 past 65535
       vv, s   (ncode, 3) float32;  pole (ncode, 3) int32: row of kbt, or -1 (no poles)
-      kbt     (nrow, P) float32: each pole's kb~ = kb l / (eps0 A'); ka, h (P,): its ka, (1 + ka) / 2
+      kbt     (nrow, P) float32: each pole's kb~ = kb l / (eps0 A'); ka (P,): its ka; h (2P,): (1 + ka) / 2, then
+              its sg (1: Debye, -1: a conducting sheet's R-L branch)
       slot    (Nx, Ny, Nz) int32: the node's row in the pole currents (nslot, 3, P), -1 elsewhere
       G       float32 [d | 1/d | dual | 1/dual], each [x | y | z] (d and 1/d zero past the last line)
       ke, kh  dt / eps0, dt / mu0
 
-    Debye pole currents are kept scaled: i~ = i l / (eps0 A'), so that V' = vv V + vi c - dt s sum(h i~) and
-    i~' = ka i~ + kb~ (V' - V) need no geometry."""
+    Pole currents are kept scaled: i~ = i l / (eps0 A'), so that V' = vv V + vi c - dt s sum(h i~) and
+    i~' = ka i~ + kb~ (V' - sg V) need no geometry."""
 
 
 def compress(op):
@@ -598,8 +724,10 @@ def compress(op):
     pid = np.zeros(N, np.int64)                                    # 0: no poles, else row + 1
     cp.P, cp.ka, cp.h, cp.kbt = 0, np.zeros(0, np.float32), np.zeros(0, np.float32), np.zeros((0, 0), np.float32)
     if op.debye is not None:
-        idx, ka, kb = op.debye
-        kas, col = np.unique(ka, return_inverse=True)
+        idx, ka, kb, sg = op.debye
+        pairs, col = np.unique(np.stack([ka, sg], 1), axis=0, return_inverse=True)   # the poles: (ka, sg)
+        col = col.ravel()
+        kas, sgs = pairs[:, 0], pairs[:, 1]
         cp.P = len(kas)
         kbt = np.zeros((N, cp.P))
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -610,7 +738,7 @@ def compress(op):
         pid[rows_e] = inv.ravel() + 1
         cp.kbt = rows.view(np.float32).reshape(len(rows), cp.P).copy()
         cp.ka = kas.astype(np.float32)
-        cp.h = (0.5 * (1 + kas)).astype(np.float32)
+        cp.h = np.concatenate([0.5 * (1 + kas), sgs]).astype(np.float32)          # [h | sg]
     key = (vv_b.astype(np.uint64) << np.uint64(32)) | s_b.astype(np.uint64)
     k1, inv1 = np.unique(key, return_inverse=True)
     both = inv1.astype(np.int64) * (int(pid.max()) + 1) + pid
@@ -853,7 +981,8 @@ def describe(op):
              f"Mur ABC edges\t\t: {0 if op.mur is None else len(op.mur[0])}",
              "PML sides\t\t: " + (', '.join(f"{C.AXES[s_['axis']]}{'max' if s_['hi'] else 'min'} ({s_['n']} cells)"
                                              for s_ in op.pml) or 'none'),
-             f"Debye pole edges\t: {0 if op.debye is None else len(op.debye[0])}",
+             f"Debye pole edges\t: {0 if op.debye is None else int((op.debye[3] > 0).sum())}",
+             f"Conducting sheet edges\t: {getattr(op, 'n_sheet', 0)}",
              f"Probes\t\t\t: {len(op.probes)}",
              f"Field dumps\t\t: {len(op.dumps)}",
              f"FDTD timestep is: {op.dt:g} s; Nyquist rate: {op.nyquist} timesteps "

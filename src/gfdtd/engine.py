@@ -178,9 +178,9 @@ class NumpyBackend:
                                  kH1=xp.asarray(local(op.iv[t1], sl['h0'])), kH2=xp.asarray(local(op.iv[t2], sl['h0'])),
                                  **{k: xp.asarray(sl[k], dt) for k in ('bE', 'cE', 'bH', 'cH')}))
         if self.dense and op.debye is not None:
-            idx, ka, kb = op.debye
+            idx, ka, kb, sg = op.debye
             self.db_idx = xp.asarray(idx)
-            self.db_ka, self.db_kb, self.db_h = (xp.asarray(v, dt) for v in (ka, kb, 0.5 * (1 + ka)))
+            self.db_ka, self.db_kb, self.db_h, self.db_sg = (xp.asarray(v, dt) for v in (ka, kb, 0.5 * (1 + ka), sg))
             self.db_vi = vi_at(idx)
             self.db_i = xp.zeros(len(idx), dt)
 
@@ -230,7 +230,8 @@ class NumpyBackend:
         Iz[:-1, :-1, :] -= az[:-1, :-1, :] * (Vy[1:, :-1, :] - Vy[:-1, :-1, :] - Vx[:-1, 1:, :] + Vx[:-1, :-1, :])
 
     def update_E(self):
-        """The E update with the Debye poles folded in: V' = vv V + vi (c - sum h i), i' = ka i + kb (V' - V)."""
+        """The E update with the poles folded in: V' = vv V + vi (c - sum h i), i' = ka i + kb (V' - sg V) (sg 1:
+        Debye, -1: a conducting sheet's R-L branch)."""
         v = self.V.reshape(-1)
         if self.op.debye is not None:
             old = v[self.db_idx]
@@ -252,7 +253,7 @@ class NumpyBackend:
         self.V[2] += self.vi[2] * c
         if self.op.debye is not None:
             np.subtract.at(v, self.db_idx, self.db_vi * self.db_h * self.db_i)
-            self.db_i[:] = self.db_ka * self.db_i + self.db_kb * (v[self.db_idx] - old)
+            self.db_i[:] = self.db_ka * self.db_i + self.db_kb * (v[self.db_idx] - self.db_sg * old)
 
     def _pml(self, field):
         """Each slab's psi update and terms (numpy): the slab's axis moved first."""
