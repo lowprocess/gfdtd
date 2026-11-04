@@ -370,7 +370,7 @@ def _sheet_edges(sheets, sheet_of, sheet_m, grid, lE, dt, f_max, notes):
     for p in {id(p): p for p, _ in sheets}.values():
         rms = getattr(p, 'roughness', 0.0) or 0.0
         notes.append(f"conducting sheet {p.name}: {p.conductivity:g} S/m, {p.thickness * 1e6:g} um" +
-                     (f", {rms * 1e6:g} um RMS rough (Hammerstad, fitted from DC to {2 * f_max / 1e9:g} GHz)" if rms else
+                     (f", {rms * 1e6:g} um RMS rough (Hammerstad, a wideband fit to {2 * f_max / 1e9:g} GHz)" if rms else
                       f" (openEMS's model, fitted to {f_max / 1e9:g} GHz)"))
     return cat(idx).astype(np.int64), cat(cap), cat(cond), branches
 
