@@ -717,6 +717,22 @@ class Compressed:
     i~' = ka i~ + kb~ (V' - sg V) need no geometry."""
 
 
+def _unique_rows(trip):
+    """np.unique(trip, axis=0, return_inverse=True) for (n, 3) non-negative integer codes, through one int64 key
+    per row (21 bits a code): the sort of a 1-D array, where unique over rows sorts structured records - 0.4 s
+    against 6.4 s at 5.6 M nodes. Rows of larger codes fall back to np.unique."""
+    trip = np.asarray(trip)
+    if trip.size == 0 or trip.min() < 0 or trip.max() >= 1 << 21:
+        nodes, code = np.unique(trip, axis=0, return_inverse=True)
+        return nodes, code.ravel()
+    t = trip.astype(np.int64)
+    key = (t[:, 0] << 42) | (t[:, 1] << 21) | t[:, 2]
+    u, code = np.unique(key, return_inverse=True)
+    m = (1 << 21) - 1
+    nodes = np.stack([u >> 42, (u >> 21) & m, u & m], 1).astype(trip.dtype)
+    return nodes, code.ravel()
+
+
 def compress(op):
     """op.vv / op.vi / op.iv / op.debye as a Compressed operator (exact to 2^-20 in vv and s)."""
     g, sh, dt = op.grid, op.shape, op.dt
@@ -763,7 +779,7 @@ def compress(op):
     first[ecode[::-1]] = np.arange(N)[::-1]                         # one edge of each edge code
     evv, es, epole = vv_q[first].astype(np.float32), s_q[first].astype(np.float32), (pid[first] - 1).astype(np.int32)
     trip = ecode.reshape(3, -1).T                                   # per node: its three edge codes
-    nodes, code = np.unique(trip, axis=0, return_inverse=True)
+    nodes, code = _unique_rows(trip)
     cp.vv, cp.s, cp.pole = evv[nodes], es[nodes], epole[nodes]      # (ncode, 3)
     cp.ncode = len(nodes)
     dtype = np.uint8 if cp.ncode <= 255 else (np.uint16 if cp.ncode <= 65535 else np.uint32)

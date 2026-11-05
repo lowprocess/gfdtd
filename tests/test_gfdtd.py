@@ -825,3 +825,41 @@ def test_finished_sheet_fit_and_xml(tmp_path):
     back.ReadFromXML(str(tmp_path / 'm.xml'))
     p = next(q for q in back.GetAllProperties() if q.name == 'cu')
     assert np.allclose(p.finish, enig) and p.finish_share == 0.4 and p.face
+
+
+def test_far_field_face_sums_match_the_per_axis_sum():
+    """The face sum (normal axis as a phase, one matrix product over the tangential components) is the per-axis
+    sum openEMS does, on faces normal to each axis, at any phase centre."""
+    from gfdtd import nf2ff as NF
+    rng = np.random.default_rng(1)
+    th, ph = np.radians(np.arange(0, 181, 15.0)), np.radians(np.arange(0, 361, 20.0))
+    T, P = np.meshgrid(th, ph, indexing='ij')
+    rh = np.stack([np.sin(T) * np.cos(P), np.sin(T) * np.sin(P), np.cos(T)], -1).reshape(-1, 3)
+    uniq = [(v, i.ravel()) for v, i in (np.unique(np.round(rh[:, b], 13), return_inverse=True) for b in range(3))]
+    k, centre = 2 * np.pi * 2.4e9 / 3e8, np.array([1e-3, -2e-3, 0.5e-3])
+    for a in range(3):
+        n = [7, 5, 4]
+        n[a] = 1
+        coords = [np.sort(rng.uniform(-0.02, 0.02, m)) for m in n]
+        J = rng.normal(size=n + [3]) + 1j * rng.normal(size=n + [3])
+        M = rng.normal(size=n + [3]) + 1j * rng.normal(size=n + [3])
+        J[..., a] = M[..., a] = 0                                   # tangential currents, as n x H, n x E
+        face = dict(coords=coords, J=[J], M=[M])
+        fast = np.zeros((len(rh), 6), complex)
+        NF._face_sums(face, 0, k, uniq, centre, fast)
+        ref = np.zeros((len(rh), 6), complex)
+        ph = [np.exp(1j * k * np.outer(rh[:, b], coords[b] - centre[b])) for b in range(3)]
+        for off, src in ((0, J), (3, M)):
+            for c in range(3):
+                ref[:, off + c] = np.einsum('dx,dy,dz,xyz->d', ph[0], ph[1], ph[2], src[..., c])
+        assert np.allclose(fast, ref, rtol=1e-12, atol=1e-12 * np.abs(ref).max())
+
+
+def test_unique_rows_is_numpys():
+    from gfdtd.operator import _unique_rows
+    rng = np.random.default_rng(2)
+    for hi in (3, 40, 1 << 20, 1 << 22):                            # the last past the packed key: numpy's own
+        t = rng.integers(0, hi, (5000, 3))
+        n0, c0 = np.unique(t, axis=0, return_inverse=True)
+        n1, c1 = _unique_rows(t)
+        assert np.array_equal(n0, n1) and np.array_equal(c0.ravel(), c1)

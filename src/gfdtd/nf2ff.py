@@ -133,27 +133,56 @@ def _image(f, a, pos, kind):
     return dict(coords=coords, J=[j * sj for j in f['J']], M=[m * -sj for m in f['M']], P=[0.0] * len(f['P']))
 
 
+def _phases(k, uniq, coords, center, b):
+    """e^(jk r^_b (x_b - c_b)) (ndir, n_b): r^_b takes few distinct values over a (theta, phi) grid (37 and 327 of
+    2701 directions on a 5 degree sphere), so the exponentials are taken once per value and gathered."""
+    vals, inv = uniq[b]
+    return np.exp(1j * k * np.outer(vals, coords[b] - center[b]))[inv]
+
+
+def _face_sums(face, fi, k, uniq, center, NL):
+    """Add one face's sum_xyz e^(jk r^.r') [J | M] to NL (ndir, 6). A recorded face is one node thick along its
+    normal a: that axis is a phase per direction, and the two tangential ones one matrix product over the four
+    tangential components of J and M (n x H, n x E have no normal one). Faces of any other shape: one axis at a
+    time, as openEMS sums them."""
+    cs = face['coords']
+    n = [len(c) for c in cs]
+    if 1 not in n:
+        ph_ax = [_phases(k, uniq, cs, center, b) for b in range(3)]                       # (ndir, n_b)
+        for src, off in ((face['J'][fi], 0), (face['M'][fi], 3)):
+            nx, ny, nz = src.shape[:3]
+            for c in range(3):
+                S = src[..., c]
+                if not np.any(S):
+                    continue
+                t = (ph_ax[0] @ S.reshape(nx, ny * nz)).reshape(-1, ny, nz)                # (ndir, ny, nz)
+                t = np.einsum('dyz,dy->dz', t, ph_ax[1])
+                NL[:, off + c] += np.einsum('dz,dz->d', t, ph_ax[2])
+        return
+    a = n.index(1)
+    b1, b2 = [b for b in range(3) if b != a]
+    live = [c for c in range(6) if c % 3 != a]
+    S = np.concatenate([face['J'][fi], face['M'][fi]], -1)                                # (nx, ny, nz, 6)
+    S = np.moveaxis(S, (b1, b2, a), (0, 1, 2))[:, :, 0, live]                             # (n1, n2, 4)
+    n1, n2 = S.shape[:2]
+    t = (_phases(k, uniq, cs, center, b1) @ S.reshape(n1, n2 * 4)).reshape(-1, n2, 4)     # (ndir, n2, 4)
+    t = np.einsum('dyc,dy->dc', t, _phases(k, uniq, cs, center, b2))
+    NL[:, live] += _phases(k, uniq, cs, center, a)[:, :1] * t
+
+
 def far_field(faces, freq, th, ph, r, center):
     """[dict(E_theta, E_phi, P_rad (ntheta, nphi), Prad, Dmax)] per frequency."""
     T, P = np.meshgrid(th, ph, indexing='ij')
     rh = np.stack([np.sin(T) * np.cos(P), np.sin(T) * np.sin(P), np.cos(T)], -1).reshape(-1, 3)   # (ndir, 3)
+    uniq = [np.unique(np.round(rh[:, b], 13), return_inverse=True) for b in range(3)]
+    uniq = [(v, i.ravel()) for v, i in uniq]
     out = []
     for fi, f in enumerate(freq):
         k = 2 * np.pi * f / C0
-        N = np.zeros((len(rh), 3), complex)
-        L = np.zeros((len(rh), 3), complex)
+        NL = np.zeros((len(rh), 6), complex)
         for face in faces:
-            ph_ax = [np.exp(1j * k * np.outer(rh[:, b], face['coords'][b] - center[b])) for b in range(3)]   # (ndir, n_b)
-            for src, acc in ((face['J'][fi], N), (face['M'][fi], L)):
-                nx, ny, nz = src.shape[:3]
-                for c in range(3):
-                    S = src[..., c]
-                    if not np.any(S):
-                        continue
-                    # sum_xyz Px[d, x] Py[d, y] Pz[d, z] S[x, y, z], one axis at a time
-                    t = (ph_ax[0] @ S.reshape(nx, ny * nz)).reshape(-1, ny, nz)              # (ndir, ny, nz)
-                    t = np.einsum('dyz,dy->dz', t, ph_ax[1])
-                    acc[:, c] += np.einsum('dz,dz->d', t, ph_ax[2])
+            _face_sums(face, fi, k, uniq, center, NL)
+        N, L = NL[:, :3], NL[:, 3:]
         st, ct, sp, cph = np.sin(T).ravel(), np.cos(T).ravel(), np.sin(P).ravel(), np.cos(P).ravel()
         theta_c = lambda A: (A[:, 0] * cph + A[:, 1] * sp) * ct - A[:, 2] * st
         phi_c = lambda A: -A[:, 0] * sp + A[:, 1] * cph
